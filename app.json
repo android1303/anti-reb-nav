@@ -36,6 +36,11 @@
           "locationAlwaysAndWhenInUsePermission": "Додатку потрібен доступ до GPS для фіксації Ground Truth координат."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "7637162f-ee02-4b92-82a0-b78532aa8336"
+      }
+    }
   }
 }

@@ -22,6 +22,7 @@ export default function App() {
 
   const latestData = useRef({ speed: 0, heading: 0, pressure: 0, lat: null, lon: null });
 
+  // Оновлюємо рефи
   useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
   useEffect(() => { latestData.current.pressure = currentPressure; }, [currentPressure]);
   useEffect(() => {
@@ -29,21 +30,7 @@ export default function App() {
     latestData.current.lon = location?.coords?.longitude || null;
   }, [location]);
 
-  useEffect(() => {
-    const requestAndroidPermissions = async () => {
-      if (Platform.OS === 'android') {
-        try {
-          await PermissionsAndroid.requestMultiple([
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-            PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-          ]);
-        } catch (err) {}
-      }
-    };
-    requestAndroidPermissions();
-  }, []);
-
+  // Ініціалізація бази
   useEffect(() => {
     telemetry.init(db);
     updateBufferCount();
@@ -54,6 +41,7 @@ export default function App() {
     setBufferCount(count);
   };
 
+  // Таймер запису
   useEffect(() => {
     let interval;
     if (isRecording) {
@@ -67,14 +55,22 @@ export default function App() {
     };
   }, [isRecording]); 
 
+  // Барометр (не вимагає небезпечних прав, стартує безпечно)
   useEffect(() => {
     Barometer.setUpdateInterval(1000);
-    const baroSubscription = Barometer.addListener(data => {
-      setCurrentPressure(data.pressure);
-    });
-    return () => { baroSubscription.remove(); };
+    let baroSubscription;
+    const startBarometer = async () => {
+      if (await Barometer.isAvailableAsync()) {
+        baroSubscription = Barometer.addListener(data => {
+          setCurrentPressure(data.pressure);
+        });
+      }
+    };
+    startBarometer();
+    return () => { if (baroSubscription) baroSubscription.remove(); };
   }, []);
 
+  // GPS (Вимагає прав тільки при включенні тумблера)
   useEffect(() => {
     let locSubscription;
     (async () => {
@@ -97,14 +93,30 @@ export default function App() {
     };
   }, [isGpsEnabled]);
 
+  // Bluetooth (Запитує права тільки при натисканні на кнопку OBD)
   const connectBluetooth = async () => {
     try {
+      if (Platform.OS === 'android') {
+        const granted = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+        if (granted['android.permission.BLUETOOTH_CONNECT'] !== PermissionsAndroid.RESULTS.GRANTED) {
+          setRawObd('Немає дозволу на Bluetooth');
+          return;
+        }
+      }
+
+      setRawObd('Підключення...');
       const bonded = await RNBluetoothClassic.getBondedDevices();
       const obdDevice = bonded.find(d => d.name.includes('OBD') || d.name.includes('ELM'));
+      
       if (obdDevice) {
         const connected = await obdDevice.connect();
         if (connected) {
           setIsBluetoothConnected(true);
+          setRawObd('Налаштування адаптера...');
           
           await obdDevice.write('ATZ\r');
           await new Promise(r => setTimeout(r, 1000));
@@ -118,11 +130,17 @@ export default function App() {
           await new Promise(r => setTimeout(r, 500));
           await obdDevice.read();
 
+          setRawObd('Готово. Читаю швидкість...');
           startObdPolling(obdDevice);
+        } else {
+          setRawObd('Помилка з\'єднання');
         }
+      } else {
+        setRawObd('Пристрій OBD не знайдено');
       }
     } catch (err) {
       setIsBluetoothConnected(false);
+      setRawObd(`Помилка: ${err.message}`);
     }
   };
 
@@ -133,9 +151,11 @@ export default function App() {
         const response = await obdDevice.read();
         
         if (response) {
+          // Видаляємо пробіли і спецсимволи, щоб бачити чистий рядок
           const cleanString = response.replace(/[\r\n\s>]/g, '');
           setRawObd(cleanString); 
           
+          // Шукаємо правильну відповідь 41 0D
           const match = cleanString.match(/410D([0-9A-F]{2})/i);
           if (match && match[1]) {
              const speed = parseInt(match[1], 16);
@@ -144,7 +164,9 @@ export default function App() {
              }
           }
         }
-      } catch (e) {}
+      } catch (e) {
+        setRawObd('Помилка читання');
+      }
     }, 1000);
   };
 

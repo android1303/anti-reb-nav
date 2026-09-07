@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid } from 'react-native';
 import * as Location from 'expo-location';
 import { Magnetometer, Barometer } from 'expo-sensors';
 import RNBluetoothClassic from 'react-native-bluetooth-classic';
@@ -23,9 +23,21 @@ export default function App() {
   const [device, setDevice] = useState(null);
 
   useEffect(() => {
-    telemetry.init(db);
-    updateBufferCount();
-  }, []);
+  const requestAndroidPermissions = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ]);
+      } catch (err) {
+        console.warn('Помилка запиту дозволів', err);
+      }
+    }
+  };
+  requestAndroidPermissions();
+}, []);
 
   const updateBufferCount = async () => {
     const count = await telemetry.getBufferCount();

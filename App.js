@@ -1,14 +1,13 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid } from 'react-native';
 import * as Location from 'expo-location';
-import { Magnetometer, Barometer } from 'expo-sensors';
+import { Barometer } from 'expo-sensors';
 import RNBluetoothClassic from 'react-native-bluetooth-classic';
 import * as telemetry from './telemetry';
 import { db } from './firebaseConfig';
 
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
-  const [currentHeading, setCurrentHeading] = useState(0);
   const [currentPressure, setCurrentPressure] = useState(0);
   const [location, setLocation] = useState(null);
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
@@ -18,26 +17,37 @@ export default function App() {
   const [syncError, setSyncError] = useState(false);
   
   const [isRecording, setIsRecording] = useState(false);
-  
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
-  const [device, setDevice] = useState(null);
+  const [rawObd, setRawObd] = useState(''); 
+
+  const latestData = useRef({ speed: 0, heading: 0, pressure: 0, lat: null, lon: null });
+
+  useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
+  useEffect(() => { latestData.current.pressure = currentPressure; }, [currentPressure]);
+  useEffect(() => {
+    latestData.current.lat = location?.coords?.latitude || null;
+    latestData.current.lon = location?.coords?.longitude || null;
+  }, [location]);
 
   useEffect(() => {
-  const requestAndroidPermissions = async () => {
-    if (Platform.OS === 'android') {
-      try {
-        await PermissionsAndroid.requestMultiple([
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        ]);
-      } catch (err) {
-        console.warn('Помилка запиту дозволів', err);
+    const requestAndroidPermissions = async () => {
+      if (Platform.OS === 'android') {
+        try {
+          await PermissionsAndroid.requestMultiple([
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+            PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          ]);
+        } catch (err) {}
       }
-    }
-  };
-  requestAndroidPermissions();
-}, []);
+    };
+    requestAndroidPermissions();
+  }, []);
+
+  useEffect(() => {
+    telemetry.init(db);
+    updateBufferCount();
+  }, []);
 
   const updateBufferCount = async () => {
     const count = await telemetry.getBufferCount();
@@ -48,38 +58,21 @@ export default function App() {
     let interval;
     if (isRecording) {
       interval = setInterval(async () => {
-        await telemetry.recordPoint({
-          speed: currentSpeed,
-          heading: currentHeading,
-          pressure: currentPressure,
-          lat: location?.coords?.latitude || null,
-          lon: location?.coords?.longitude || null,
-        });
+        await telemetry.recordPoint(latestData.current);
         updateBufferCount();
       }, 1000); 
     }
     return () => {
       if (interval) clearInterval(interval);
     };
-  }, [isRecording, currentSpeed, currentHeading, currentPressure, location]);
+  }, [isRecording]); 
 
   useEffect(() => {
-    Magnetometer.setUpdateInterval(1000);
-    const magSubscription = Magnetometer.addListener(data => {
-      let heading = Math.atan2(data.y, data.x) * (180 / Math.PI);
-      if (heading < 0) heading += 360;
-      setCurrentHeading(Math.round(heading));
-    });
-
     Barometer.setUpdateInterval(1000);
     const baroSubscription = Barometer.addListener(data => {
       setCurrentPressure(data.pressure);
     });
-
-    return () => {
-      magSubscription.remove();
-      baroSubscription.remove();
-    };
+    return () => { baroSubscription.remove(); };
   }, []);
 
   useEffect(() => {
@@ -104,7 +97,6 @@ export default function App() {
     };
   }, [isGpsEnabled]);
 
-  // --- ОНОВЛЕНА ЛОГІКА ELM327 ---
   const connectBluetooth = async () => {
     try {
       const bonded = await RNBluetoothClassic.getBondedDevices();
@@ -112,19 +104,17 @@ export default function App() {
       if (obdDevice) {
         const connected = await obdDevice.connect();
         if (connected) {
-          setDevice(obdDevice);
           setIsBluetoothConnected(true);
           
-          // Ініціалізація ELM327
-          await obdDevice.write('ATZ\r'); // Скидання
+          await obdDevice.write('ATZ\r');
           await new Promise(r => setTimeout(r, 1000));
-          await obdDevice.read(); // Очищення буфера
+          await obdDevice.read();
           
-          await obdDevice.write('ATE0\r'); // Вимкнути луну (Echo off)
+          await obdDevice.write('ATE0\r');
           await new Promise(r => setTimeout(r, 500));
           await obdDevice.read();
           
-          await obdDevice.write('ATSP0\r'); // Авто-пошук протоколу
+          await obdDevice.write('ATSP0\r');
           await new Promise(r => setTimeout(r, 500));
           await obdDevice.read();
 
@@ -132,7 +122,6 @@ export default function App() {
         }
       }
     } catch (err) {
-      console.log('BT Connection Error', err);
       setIsBluetoothConnected(false);
     }
   };
@@ -144,12 +133,10 @@ export default function App() {
         const response = await obdDevice.read();
         
         if (response) {
-          // Видаляємо всі пробіли, переноси рядків та символ '>'
-          const cleanRes = response.replace(/[\r\n\s>]/g, '');
+          const cleanString = response.replace(/[\r\n\s>]/g, '');
+          setRawObd(cleanString); 
           
-          // Шукаємо маркер відповіді швидкості (410D) і наступні 2 символи (HEX швидкості)
-          const match = cleanRes.match(/410D([0-9A-F]{2})/i);
-          
+          const match = cleanString.match(/410D([0-9A-F]{2})/i);
           if (match && match[1]) {
              const speed = parseInt(match[1], 16);
              if (!isNaN(speed)) {
@@ -157,12 +144,9 @@ export default function App() {
              }
           }
         }
-      } catch (e) {
-        console.log('OBD Read Error');
-      }
-    }, 1000); // Опитування раз на секунду
+      } catch (e) {}
+    }, 1000);
   };
-  // ---------------------------------
 
   const handleSync = async () => {
     try {
@@ -197,9 +181,8 @@ export default function App() {
           <Text style={styles.cardSub}>{isBluetoothConnected ? "Онлайн" : "OBD офлайн"}</Text>
         </View>
         <View style={styles.card}>
-          <Text style={styles.cardLabel}>КУРС (HEADING / Z)</Text>
-          <Text style={styles.cardValue}>{currentHeading}°</Text>
-          <Text style={styles.cardSub}>Магнітометр / Гіро</Text>
+          <Text style={styles.cardLabel}>RAW ДАНІ (ДЕБАГ)</Text>
+          <Text style={[styles.cardValueSmall, {color: '#facc15'}]}>{rawObd || 'Очікування...'}</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ТИСК (BARO)</Text>
@@ -216,12 +199,7 @@ export default function App() {
 
       <View style={styles.toggleRow}>
         <Text style={styles.toggleLabel}>Еталонний GPS (Ground Truth)</Text>
-        <Switch 
-          value={isGpsEnabled} 
-          onValueChange={setIsGpsEnabled}
-          trackColor={{ false: "#334155", true: "#0284c7" }}
-          thumbColor={"#fff"}
-        />
+        <Switch value={isGpsEnabled} onValueChange={setIsGpsEnabled} trackColor={{ false: "#334155", true: "#0284c7" }} thumbColor={"#fff"} />
       </View>
 
       <View style={styles.bufferInfo}>
@@ -237,31 +215,16 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity 
-        style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]} 
-        onPress={() => setIsRecording(!isRecording)}
-      >
-        <Text style={styles.recordBtnText}>
-          {isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}
-        </Text>
+      <TouchableOpacity style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]} onPress={() => setIsRecording(!isRecording)}>
+        <Text style={styles.recordBtnText}>{isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}</Text>
       </TouchableOpacity>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0a0f1c',
-    paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight + 10 : 40,
-    paddingHorizontal: 15,
-  },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
-  },
+  container: { flex: 1, backgroundColor: '#0a0f1c', paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight + 10 : 40, paddingHorizontal: 15 },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
   headerTitle: { color: '#38bdf8', fontSize: 20, fontWeight: '900', letterSpacing: 1 },
   statusIcons: { flexDirection: 'row', gap: 10 },
   badge: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },
@@ -272,7 +235,7 @@ const styles = StyleSheet.create({
   card: { backgroundColor: '#151c2c', width: '48%', padding: 15, borderRadius: 10, marginBottom: 15, borderWidth: 1, borderColor: '#222f47' },
   cardLabel: { color: '#94a3b8', fontSize: 11, fontWeight: 'bold', marginBottom: 5 },
   cardValue: { color: 'white', fontSize: 28, fontWeight: 'bold' },
-  cardValueSmall: { color: '#38bdf8', fontSize: 16, fontWeight: 'bold', lineHeight: 22 },
+  cardValueSmall: { color: '#38bdf8', fontSize: 15, fontWeight: 'bold', lineHeight: 22 },
   cardSub: { color: '#64748b', fontSize: 11, marginTop: 5 },
   toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#151c2c', padding: 15, borderRadius: 10, marginBottom: 20, borderWidth: 1, borderColor: '#222f47' },
   toggleLabel: { color: 'white', fontSize: 14, fontWeight: 'bold' },

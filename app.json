@@ -35,7 +35,8 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Додатку потрібен доступ до GPS для фіксації Ground Truth координат."
         }
-      ]
+      ],
+      "expo-sharing"
     ],
     "extra": {
       "eas": {

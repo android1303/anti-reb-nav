@@ -1,28 +1,29 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import { Barometer } from 'expo-sensors';
 import RNBluetoothClassic from 'react-native-bluetooth-classic';
-import * as telemetry from './telemetry';
+import telemetry from './telemetry';
 import { db } from './firebaseConfig';
+import { exportFirestoreToCSV } from './exportService';
 
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
   const [currentPressure, setCurrentPressure] = useState(0);
   const [location, setLocation] = useState(null);
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
-  
+
   const [bufferCount, setBufferCount] = useState(0);
   const [lastSyncTime, setLastSyncTime] = useState(null);
   const [syncError, setSyncError] = useState(false);
-  
+  const [isExporting, setIsExporting] = useState(false);
+
   const [isRecording, setIsRecording] = useState(false);
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
-  const [rawObd, setRawObd] = useState(''); 
+  const [rawObd, setRawObd] = useState('Система готова до запуску'); 
 
   const latestData = useRef({ speed: 0, heading: 0, pressure: 0, lat: null, lon: null });
 
-  // Оновлюємо рефи
   useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
   useEffect(() => { latestData.current.pressure = currentPressure; }, [currentPressure]);
   useEffect(() => {
@@ -30,70 +31,89 @@ export default function App() {
     latestData.current.lon = location?.coords?.longitude || null;
   }, [location]);
 
-  // Ініціалізація бази
+  // Безпечна ініціалізація телеметрії
   useEffect(() => {
-    telemetry.init(db);
-    updateBufferCount();
+    let isMounted = true;
+    const initApp = async () => {
+      try {
+        if (db) {
+          await telemetry.init(db);
+          telemetry.setOnBufferChange((count) => {
+            if (isMounted) setBufferCount(count);
+          });
+          const count = telemetry.getBufferSize();
+          if (isMounted) setBufferCount(count);
+        }
+      } catch (e) {
+        console.error('Помилка ініціалізації:', e);
+      }
+    };
+    initApp();
+    return () => { isMounted = false; };
   }, []);
 
-  const updateBufferCount = async () => {
-    const count = await telemetry.getBufferCount();
-    setBufferCount(count);
-  };
-
-  // Таймер запису
+  // Таймер запису телеметрії
   useEffect(() => {
     let interval;
     if (isRecording) {
       interval = setInterval(async () => {
-        await telemetry.recordPoint(latestData.current);
-        updateBufferCount();
+        try {
+          await telemetry.recordPoint(latestData.current);
+          setBufferCount(telemetry.getBufferSize());
+        } catch (err) {
+          console.error('Помилка запису:', err);
+        }
       }, 1000); 
     }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
+    return () => { if (interval) clearInterval(interval); };
   }, [isRecording]); 
 
-  // Барометр (не вимагає небезпечних прав, стартує безпечно)
+  // Барометр
   useEffect(() => {
     Barometer.setUpdateInterval(1000);
     let baroSubscription;
     const startBarometer = async () => {
-      if (await Barometer.isAvailableAsync()) {
-        baroSubscription = Barometer.addListener(data => {
-          setCurrentPressure(data.pressure);
-        });
+      try {
+        if (await Barometer.isAvailableAsync()) {
+          baroSubscription = Barometer.addListener(data => {
+            setCurrentPressure(data.pressure);
+          });
+        }
+      } catch (e) {
+        console.warn('Барометр недоступний:', e);
       }
     };
     startBarometer();
     return () => { if (baroSubscription) baroSubscription.remove(); };
   }, []);
 
-  // GPS (Вимагає прав тільки при включенні тумблера)
+  // GPS
   useEffect(() => {
     let locSubscription;
     (async () => {
-      if (isGpsEnabled) {
-        let { status } = await Location.requestForegroundPermissionsAsync();
-        if (status === 'granted') {
-          locSubscription = await Location.watchPositionAsync(
-            { accuracy: Location.Accuracy.High, timeInterval: 1000 },
-            (loc) => setLocation(loc)
-          );
+      try {
+        if (isGpsEnabled) {
+          let { status } = await Location.requestForegroundPermissionsAsync();
+          if (status === 'granted') {
+            locSubscription = await Location.watchPositionAsync(
+              { accuracy: Location.Accuracy.High, timeInterval: 1000 },
+              (loc) => setLocation(loc)
+            );
+          } else {
+            setIsGpsEnabled(false);
+          }
         } else {
-          setIsGpsEnabled(false);
+          setLocation(null);
         }
-      } else {
-        setLocation(null);
+      } catch (e) {
+        console.warn('Помилка GPS:', e);
+        setIsGpsEnabled(false);
       }
     })();
-    return () => {
-      if (locSubscription) locSubscription.remove();
-    };
+    return () => { if (locSubscription) locSubscription.remove(); };
   }, [isGpsEnabled]);
 
-  // Bluetooth (Запитує права тільки при натисканні на кнопку OBD)
+  // Bluetooth
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -103,40 +123,32 @@ export default function App() {
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
         ]);
         if (granted['android.permission.BLUETOOTH_CONNECT'] !== PermissionsAndroid.RESULTS.GRANTED) {
-          setRawObd('Немає дозволу на Bluetooth');
+          setRawObd('Немає дозволу');
           return;
         }
       }
 
-      setRawObd('Підключення...');
+      setRawObd('Сканування...');
       const bonded = await RNBluetoothClassic.getBondedDevices();
-      const obdDevice = bonded.find(d => d.name.includes('OBD') || d.name.includes('ELM'));
-      
+      const obdDevice = bonded.find(d => 
+        (d.name && d.name.toUpperCase().includes('OBD')) || 
+        (d.name && d.name.toUpperCase().includes('ELM'))
+      );
+
       if (obdDevice) {
+        setRawObd(`Знайдено ${obdDevice.name}. Підключення...`);
         const connected = await obdDevice.connect();
         if (connected) {
           setIsBluetoothConnected(true);
-          setRawObd('Налаштування адаптера...');
-          
-          await obdDevice.write('ATZ\r');
-          await new Promise(r => setTimeout(r, 1000));
-          await obdDevice.read();
-          
-          await obdDevice.write('ATE0\r');
-          await new Promise(r => setTimeout(r, 500));
-          await obdDevice.read();
-          
-          await obdDevice.write('ATSP0\r');
-          await new Promise(r => setTimeout(r, 500));
-          await obdDevice.read();
-
-          setRawObd('Готово. Читаю швидкість...');
+          await obdDevice.write('ATZ\r'); await new Promise(r => setTimeout(r, 1000)); await obdDevice.read();
+          await obdDevice.write('ATE0\r'); await new Promise(r => setTimeout(r, 500)); await obdDevice.read();
+          await obdDevice.write('ATSP0\r'); await new Promise(r => setTimeout(r, 500)); await obdDevice.read();
           startObdPolling(obdDevice);
         } else {
           setRawObd('Помилка з\'єднання');
         }
       } else {
-        setRawObd('Пристрій OBD не знайдено');
+        setRawObd('ELM не знайдено');
       }
     } catch (err) {
       setIsBluetoothConnected(false);
@@ -149,23 +161,17 @@ export default function App() {
       try {
         await obdDevice.write('010D\r');
         const response = await obdDevice.read();
-        
         if (response) {
-          // Видаляємо пробіли і спецсимволи, щоб бачити чистий рядок
           const cleanString = response.replace(/[\r\n\s>]/g, '');
           setRawObd(cleanString); 
-          
-          // Шукаємо правильну відповідь 41 0D
           const match = cleanString.match(/410D([0-9A-F]{2})/i);
           if (match && match[1]) {
              const speed = parseInt(match[1], 16);
-             if (!isNaN(speed)) {
-               setCurrentSpeed(speed);
-             }
+             if (!isNaN(speed)) setCurrentSpeed(speed);
           }
         }
       } catch (e) {
-        setRawObd('Помилка читання');
+        setRawObd('Помилка OBD');
       }
     }, 1000);
   };
@@ -174,11 +180,20 @@ export default function App() {
     try {
       setSyncError(false);
       await telemetry.syncNow();
-      updateBufferCount();
+      setBufferCount(telemetry.getBufferSize());
       const now = new Date();
       setLastSyncTime(`${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`);
     } catch (e) {
       setSyncError(true);
+    }
+  };
+
+  const handleExport = async () => {
+    setIsExporting(true);
+    const result = await exportFirestoreToCSV(db);
+    setIsExporting(false);
+    if (!result.success) {
+      Alert.alert("Помилка експорту", result.error);
     }
   };
 
@@ -198,13 +213,13 @@ export default function App() {
 
       <View style={styles.grid}>
         <View style={styles.card}>
-          <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD-II)</Text>
+          <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD)</Text>
           <Text style={styles.cardValue}>{currentSpeed}</Text>
-          <Text style={styles.cardSub}>{isBluetoothConnected ? "Онлайн" : "OBD офлайн"}</Text>
+          <Text style={styles.cardSub}>{isBluetoothConnected ? "Онлайн" : "Офлайн"}</Text>
         </View>
         <View style={styles.card}>
-          <Text style={styles.cardLabel}>RAW ДАНІ (ДЕБАГ)</Text>
-          <Text style={[styles.cardValueSmall, {color: '#facc15'}]}>{rawObd || 'Очікування...'}</Text>
+          <Text style={styles.cardLabel}>RAW (ДЕБАГ)</Text>
+          <Text style={[styles.cardValueSmall, {color: '#facc15'}]} numberOfLines={3}>{rawObd}</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ТИСК (BARO)</Text>
@@ -214,26 +229,26 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.cardLabel}>GROUND TRUTH GPS</Text>
           <Text style={styles.cardValueSmall}>
-            {location ? `${location.coords.latitude.toFixed(5)}\n${location.coords.longitude.toFixed(5)}` : 'Еталонна траєкторія'}
+            {location ? `${location.coords.latitude.toFixed(5)}\n${location.coords.longitude.toFixed(5)}` : 'Очікування GPS'}
           </Text>
         </View>
       </View>
 
       <View style={styles.toggleRow}>
-        <Text style={styles.toggleLabel}>Еталонний GPS (Ground Truth)</Text>
+        <Text style={styles.toggleLabel}>Еталонний GPS</Text>
         <Switch value={isGpsEnabled} onValueChange={setIsGpsEnabled} trackColor={{ false: "#334155", true: "#0284c7" }} thumbColor={"#fff"} />
       </View>
 
       <View style={styles.bufferInfo}>
-        <Text style={styles.bufferText}>Буфер: {bufferCount} | Останній: {lastSyncTime || '--:--:--'}</Text>
+        <Text style={styles.bufferText}>Буфер: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}</Text>
       </View>
 
       <View style={styles.controlsRow}>
         <TouchableOpacity style={styles.syncBtn} onPress={handleSync}>
-          <Text style={styles.syncBtnText}>{syncError ? 'ПОМИЛКА\n(ПОВТОРИТИ)' : 'ПОМИЛКА\n(ПОВТОРИТИ)'}</Text>
+          <Text style={styles.syncBtnText}>{syncError ? 'ПОМИЛКА' : 'СИНХРОНІЗУВАТИ'}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.syncBtn} onPress={handleSync}>
-          <Text style={styles.syncBtnText}>СИНХРОНІЗУВАТИ</Text>
+        <TouchableOpacity style={styles.syncBtn} onPress={handleExport} disabled={isExporting}>
+          <Text style={styles.syncBtnText}>{isExporting ? 'ФОРМУВАННЯ...' : 'ЕКСПОРТ (CSV)'}</Text>
         </TouchableOpacity>
       </View>
 
@@ -257,7 +272,7 @@ const styles = StyleSheet.create({
   card: { backgroundColor: '#151c2c', width: '48%', padding: 15, borderRadius: 10, marginBottom: 15, borderWidth: 1, borderColor: '#222f47' },
   cardLabel: { color: '#94a3b8', fontSize: 11, fontWeight: 'bold', marginBottom: 5 },
   cardValue: { color: 'white', fontSize: 28, fontWeight: 'bold' },
-  cardValueSmall: { color: '#38bdf8', fontSize: 15, fontWeight: 'bold', lineHeight: 22 },
+  cardValueSmall: { color: '#38bdf8', fontSize: 13, fontWeight: 'bold', lineHeight: 18 },
   cardSub: { color: '#64748b', fontSize: 11, marginTop: 5 },
   toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#151c2c', padding: 15, borderRadius: 10, marginBottom: 20, borderWidth: 1, borderColor: '#222f47' },
   toggleLabel: { color: 'white', fontSize: 14, fontWeight: 'bold' },
@@ -265,7 +280,7 @@ const styles = StyleSheet.create({
   bufferText: { color: '#38bdf8', fontWeight: 'bold' },
   controlsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15 },
   syncBtn: { backgroundColor: '#1c2539', paddingVertical: 12, flex: 0.48, alignItems: 'center', justifyContent: 'center', borderRadius: 8, borderWidth: 1, borderColor: '#334155' },
-  syncBtnText: { color: 'white', fontWeight: 'bold', textAlign: 'center', fontSize: 13 },
+  syncBtnText: { color: 'white', fontWeight: 'bold', textAlign: 'center', fontSize: 12 },
   recordBtn: { paddingVertical: 18, borderRadius: 10, alignItems: 'center' },
   recordBtnInactive: { backgroundColor: '#dc2626' },
   recordBtnActive: { backgroundColor: '#16a34a' },

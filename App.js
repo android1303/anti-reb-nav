@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid, Alert } from 'react-native';
 import * as Location from 'expo-location';
 import { Barometer } from 'expo-sensors';
-import RNBluetoothClassic from 'react-native-bluetooth-classic';
+import obdScanner from './obdScanner'; // Наш новий нативний міст
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
@@ -113,7 +113,7 @@ export default function App() {
     return () => { if (locSubscription) locSubscription.remove(); };
   }, [isGpsEnabled]);
 
-  // Bluetooth
+  // Bluetooth (НОВА ЛОГІКА ЧЕРЕЗ NATIVE MODULE)
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -123,57 +123,31 @@ export default function App() {
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
         ]);
         if (granted['android.permission.BLUETOOTH_CONNECT'] !== PermissionsAndroid.RESULTS.GRANTED) {
-          setRawObd('Немає дозволу');
+          setRawObd('Немає дозволу BLUETOOTH_CONNECT');
           return;
         }
       }
 
-      setRawObd('Сканування...');
-      const bonded = await RNBluetoothClassic.getBondedDevices();
-      const obdDevice = bonded.find(d => 
-        (d.name && d.name.toUpperCase().includes('OBD')) || 
-        (d.name && d.name.toUpperCase().includes('ELM'))
-      );
-
-      if (obdDevice) {
-        setRawObd(`Знайдено ${obdDevice.name}. Підключення...`);
-        const connected = await obdDevice.connect();
-        if (connected) {
-          setIsBluetoothConnected(true);
-          await obdDevice.write('ATZ\r'); await new Promise(r => setTimeout(r, 1000)); await obdDevice.read();
-          await obdDevice.write('ATE0\r'); await new Promise(r => setTimeout(r, 500)); await obdDevice.read();
-          await obdDevice.write('ATSP0\r'); await new Promise(r => setTimeout(r, 500)); await obdDevice.read();
-          startObdPolling(obdDevice);
-        } else {
-          setRawObd('Помилка з\'єднання');
-        }
+      setRawObd('Підключення через Native Module...');
+      
+      // Викликаємо наш новий міст
+      const connected = await obdScanner.connectToELM();
+      
+      if (connected) {
+        setIsBluetoothConnected(true);
+        // Запускаємо читання і прокидаємо колбеки для оновлення UI
+        obdScanner.startReadingSpeed(
+          (speed) => setCurrentSpeed(speed),
+          (status) => setRawObd(status)
+        );
       } else {
-        setRawObd('ELM не знайдено');
+        setIsBluetoothConnected(false);
+        setRawObd('Помилка з\'єднання');
       }
     } catch (err) {
       setIsBluetoothConnected(false);
       setRawObd(`Помилка: ${err.message}`);
     }
-  };
-
-  const startObdPolling = (obdDevice) => {
-    setInterval(async () => {
-      try {
-        await obdDevice.write('010D\r');
-        const response = await obdDevice.read();
-        if (response) {
-          const cleanString = response.replace(/[\r\n\s>]/g, '');
-          setRawObd(cleanString); 
-          const match = cleanString.match(/410D([0-9A-F]{2})/i);
-          if (match && match[1]) {
-             const speed = parseInt(match[1], 16);
-             if (!isNaN(speed)) setCurrentSpeed(speed);
-          }
-        }
-      } catch (e) {
-        setRawObd('Помилка OBD');
-      }
-    }, 1000);
   };
 
   const handleSync = async () => {
@@ -255,6 +229,11 @@ export default function App() {
       <TouchableOpacity style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]} onPress={() => setIsRecording(!isRecording)}>
         <Text style={styles.recordBtnText}>{isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}</Text>
       </TouchableOpacity>
+
+      {/* ВЕРСІЯ БІЛДА */}
+      <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 15, marginBottom: 10 }}>
+        Білд: {obdScanner.getVersion()}
+      </Text>
     </View>
   );
 }

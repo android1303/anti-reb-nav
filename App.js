@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid, Alert } from 'react-native';
 import * as Location from 'expo-location';
-import { Barometer, Gyroscope } from 'expo-sensors';
+import { Barometer, Gyroscope, Accelerometer } from 'expo-sensors';
 import obdScanner from './obdScanner'; // Наш новий нативний міст
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
@@ -22,7 +22,7 @@ export default function App() {
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску'); 
 
-  // Додано поля для сирих даних гіроскопа (X, Y, Z) у реф, щоб не перевантажувати UI
+  // Додано поля для сирих даних гіроскопа та акселерометра (X, Y, Z) у реф, щоб не перевантажувати UI
   const latestData = useRef({ 
     speed: 0, 
     heading: 0, 
@@ -31,7 +31,10 @@ export default function App() {
     lon: null, 
     gyroX: 0, 
     gyroY: 0, 
-    gyroZ: 0 
+    gyroZ: 0,
+    accelX: 0,
+    accelY: 0,
+    accelZ: 0
   });
 
   useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
@@ -105,9 +108,9 @@ export default function App() {
         if (await Gyroscope.isAvailableAsync()) {
           Gyroscope.setUpdateInterval(50); // 50 мс = 20 Гц для детального інерційного профілю
           gyroSubscription = Gyroscope.addListener(data => {
-          latestData.current.gyroX = data.x;
-          latestData.current.gyroY = data.y;
-          latestData.current.gyroZ = data.z;
+            latestData.current.gyroX = data.x;
+            latestData.current.gyroY = data.y;
+            latestData.current.gyroZ = data.z;
           });
         }
       } catch (e) {
@@ -116,6 +119,27 @@ export default function App() {
     };
     startGyroscope();
     return () => { if (gyroSubscription) gyroSubscription.remove(); };
+  }, []);
+
+  // Високочастотний Акселерометр (Сирі дані для векторів прискорення)
+  useEffect(() => {
+    let accelSubscription;
+    const startлогиАкселерометра = async () => {
+      try {
+        if (await Accelerometer.isAvailableAsync()) {
+          Accelerometer.setUpdateInterval(50); // 50 мс = 20 Гц синхронно з гіроскопом
+          accelSubscription = Accelerometer.addListener(data => {
+            latestData.current.accelX = data.x;
+            latestData.current.accelY = data.y;
+            latestData.current.accelZ = data.z;
+          });
+        }
+      } catch (e) {
+        console.warn('Акселерометр недоступний:', e);
+      }
+    };
+    startлогиАкселерометра();
+    return () => { if (accelSubscription) accelSubscription.remove(); };
   }, []);
 
   // GPS
@@ -160,9 +184,9 @@ export default function App() {
       }
 
       setRawObd('Підключення через Native Module...');
-      
+
       const connected = await obdScanner.connectToELM();
-      
+
       if (connected) {
         setIsBluetoothConnected(true);
         obdScanner.startReadingSpeed(

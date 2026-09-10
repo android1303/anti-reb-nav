@@ -1,18 +1,23 @@
 name: Expo OTA Update
-on: workflow_dispatch
- 
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: # Дозволяє також запускати вручну з сайту GitHub
+
 jobs:
   update:
     name: EAS Update
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Node
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
-          node-version: 18.x
+          node-version: 20
 
       - name: Setup Expo
         uses: expo/expo-github-action@v8
@@ -25,4 +30,4 @@ jobs:
         run: npm install
 
       - name: Publish update
-        run: eas update --branch main --message "Auto update from GitHub"
+        run: npx eas-cli update --branch main --message "Auto update from GitHub"

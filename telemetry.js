@@ -1,4 +1,3 @@
-
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
 import { collection, writeBatch, doc } from 'firebase/firestore';
@@ -70,12 +69,14 @@ class TelemetryService {
   }
 
   /**
-   * Запис точки телеметрії
+   * Запис точки телеметрії (з підтримкою осей X, Y, Z гіроскопа)
    */
-  async recordPoint({ speed, gyroZ, pressure, lat = null, lon = null, timestamp = Date.now() }) {
+  async recordPoint({ speed, gyroX = 0, gyroY = 0, gyroZ = 0, pressure, lat = null, lon = null, timestamp = Date.now() }) {
     const entry = {
       id: `${timestamp}_${Math.random().toString(36).substring(2, 8)}`,
       speed: typeof speed === 'number' ? speed : Number(speed) || 0,
+      gyroX: typeof gyroX === 'number' ? gyroX : Number(gyroX) || 0,
+      gyroY: typeof gyroY === 'number' ? gyroY : Number(gyroY) || 0,
       gyroZ: typeof gyroZ === 'number' ? gyroZ : Number(gyroZ) || 0,
       pressure: typeof pressure === 'number' ? pressure : Number(pressure) || 0,
       lat: lat !== null && lat !== undefined ? Number(lat) : null,
@@ -124,7 +125,6 @@ class TelemetryService {
     let isConnected = false;
     try {
       const netState = await NetInfo.fetch();
-      // isInternetReachable може бути null до завершення перевірки пінгу, тому перевіряємо isConnected
       isConnected = Boolean(netState.isConnected && netState.isInternetReachable !== false);
     } catch (netErr) {
       console.warn('[SYNC_ERROR] Помилка перевірки NetInfo:', netErr);

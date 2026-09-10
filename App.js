@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid, Alert } from 'react-native';
 import * as Location from 'expo-location';
-import { Barometer } from 'expo-sensors';
+import { Barometer, Gyroscope } from 'expo-sensors';
 import obdScanner from './obdScanner'; // Наш новий нативний міст
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
@@ -22,7 +22,17 @@ export default function App() {
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску'); 
 
-  const latestData = useRef({ speed: 0, heading: 0, pressure: 0, lat: null, lon: null });
+  // Додано поля для сирих даних гіроскопа (X, Y, Z) у реф, щоб не перевантажувати UI
+  const latestData = useRef({ 
+    speed: 0, 
+    heading: 0, 
+    pressure: 0, 
+    lat: null, 
+    lon: null, 
+    gyroX: 0, 
+    gyroY: 0, 
+    gyroZ: 0 
+  });
 
   useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
   useEffect(() => { latestData.current.pressure = currentPressure; }, [currentPressure]);
@@ -87,6 +97,27 @@ export default function App() {
     return () => { if (baroSubscription) baroSubscription.remove(); };
   }, []);
 
+  // Високочастотний Гіроскоп (Сирі дані для аналізу маневрів)
+  useEffect(() => {
+    let gyroSubscription;
+    const startGyroscope = async () => {
+      try {
+        if (await Gyroscope.isAvailableAsync()) {
+          Gyroscope.setUpdateInterval(50); // 50 мс = 20 Гц для детального інерційного профілю
+          gyroSubscription = Gyroscope.addListener(data => {
+            latestData.current.gyroX = data.x;
+            latestData.current.gyroY = data.y;
+            latestData.current.gyroZ = data.z;
+          });
+        }
+      } catch (e) {
+        console.warn('Гіроскоп недоступний:', e);
+      }
+    };
+    startGyroscope();
+    return () => { if (gyroSubscription) gyroSubscription.remove(); };
+  }, []);
+
   // GPS
   useEffect(() => {
     let locSubscription;
@@ -130,12 +161,10 @@ export default function App() {
 
       setRawObd('Підключення через Native Module...');
       
-      // Викликаємо наш новий міст
       const connected = await obdScanner.connectToELM();
       
       if (connected) {
         setIsBluetoothConnected(true);
-        // Запускаємо читання і прокидаємо колбеки для оновлення UI
         obdScanner.startReadingSpeed(
           (speed) => setCurrentSpeed(speed),
           (status) => setRawObd(status)

@@ -17,8 +17,8 @@ export async function exportFirestoreToCSV(db, collectionName = 'telemetry_logs'
       throw new Error('Немає даних для експорту');
     }
 
-    // 2. Формуємо заголовки CSV (додано осі гіроскопа)
-    let csvString = 'Timestamp,Date,Speed_OBD,Pressure_hPa,Latitude,Longitude,Gyro_X,Gyro_Y,Gyro_Z\n';
+    // 2. Формуємо заголовки CSV (додано осі гіроскопа та акселерометра)
+    let csvString = 'Timestamp,Date,Speed_OBD,Pressure_hPa,Latitude,Longitude,Gyro_X,Gyro_Y,Gyro_Z,Accel_X,Accel_Y,Accel_Z\n';
 
     // 3. Заповнюємо рядки
     querySnapshot.forEach((doc) => {
@@ -32,9 +32,12 @@ export async function exportFirestoreToCSV(db, collectionName = 'telemetry_logs'
       const gyroX = data.gyroX !== undefined ? data.gyroX : 0;
       const gyroY = data.gyroY !== undefined ? data.gyroY : 0;
       const gyroZ = data.gyroZ !== undefined ? data.gyroZ : 0;
+      const accelX = data.accelX !== undefined ? data.accelX : 0;
+      const accelY = data.accelY !== undefined ? data.accelY : 0;
+      const accelZ = data.accelZ !== undefined ? data.accelZ : 0;
 
       // Додаємо зібраний рядок до загального тексту CSV
-      csvString += `${timestamp},${dateStr},${speed},${pressure},${lat},${lon},${gyroX},${gyroY},${gyroZ}\n`;
+      csvString += `${timestamp},${dateStr},${speed},${pressure},${lat},${lon},${gyroX},${gyroY},${gyroZ},${accelX},${accelY},${accelZ}\n`;
     });
 
     // 4. Записуємо файл у локальний кеш

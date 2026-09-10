@@ -69,15 +69,18 @@ class TelemetryService {
   }
 
   /**
-   * Запис точки телеметрії (з підтримкою осей X, Y, Z гіроскопа)
+   * Запис точки телеметрії (з підтримкою осей гіроскопа та акселерометра)
    */
-  async recordPoint({ speed, gyroX = 0, gyroY = 0, gyroZ = 0, pressure, lat = null, lon = null, timestamp = Date.now() }) {
+  async recordPoint({ speed, gyroX = 0, gyroY = 0, gyroZ = 0, accelX = 0, accelY = 0, accelZ = 0, pressure, lat = null, lon = null, timestamp = Date.now() }) {
     const entry = {
       id: `${timestamp}_${Math.random().toString(36).substring(2, 8)}`,
       speed: typeof speed === 'number' ? speed : Number(speed) || 0,
       gyroX: typeof gyroX === 'number' ? gyroX : Number(gyroX) || 0,
       gyroY: typeof gyroY === 'number' ? gyroY : Number(gyroY) || 0,
       gyroZ: typeof gyroZ === 'number' ? gyroZ : Number(gyroZ) || 0,
+      accelX: typeof accelX === 'number' ? accelX : Number(accelX) || 0,
+      accelY: typeof accelY === 'number' ? accelY : Number(accelY) || 0,
+      accelZ: typeof accelZ === 'number' ? accelZ : Number(accelZ) || 0,
       pressure: typeof pressure === 'number' ? pressure : Number(pressure) || 0,
       lat: lat !== null && lat !== undefined ? Number(lat) : null,
       lon: lon !== null && lon !== undefined ? Number(lon) : null,

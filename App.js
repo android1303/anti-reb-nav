@@ -105,9 +105,9 @@ export default function App() {
         if (await Gyroscope.isAvailableAsync()) {
           Gyroscope.setUpdateInterval(50); // 50 мс = 20 Гц для детального інерційного профілю
           gyroSubscription = Gyroscope.addListener(data => {
-            latestData.current.gyroX = data.x;
-            latestData.current.gyroY = data.y;
-            latestData.current.gyroZ = data.z;
+          latestData.current.gyroX = data.x;
+          latestData.current.gyroY = data.y;
+          latestData.current.gyroZ = data.z;
           });
         }
       } catch (e) {

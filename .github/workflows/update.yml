@@ -24,4 +24,4 @@ jobs:
       - name: Publish update
         env:
           EXPO_TOKEN: ${{ secrets.EXPO_TOKEN }}
-        run: npx eas-cli update --branch main --non-interactive --message "Auto update from GitHub"
+        run: npx eas-cli update --branch preview --non-interactive --message "Auto update from GitHub"

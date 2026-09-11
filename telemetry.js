@@ -3,7 +3,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 const STORAGE_KEY = '@anti_reb_telemetry_buffer_v1';
-const SYNC_INTERVAL_MS = 30000; // 30 секунд
+const SYNC_INTERVAL_MS = 10000; // 10 секунд
 const MAX_BATCH_SIZE = 450; // Безпечний ліміт для batch у Firestore (макс. 500)
 const LPF_ALPHA = 0.2; // Коефіцієнт згладжування Low-Pass Filter
 const GYRO_MAX_LIMIT = 200; // Поріг фільтрації апаратних артефактів
@@ -41,6 +41,11 @@ class TelemetryService {
     // Навігаційне ядро (Dead Reckoning)
     this.posX = 0;
     this.posY = 0;
+
+    // Ground-Truth Filter (GPS)
+    this.lastLat = null;
+    this.lastLon = null;
+    this.lastGpsTimestamp = null;
   }
 
   /**
@@ -95,7 +100,7 @@ class TelemetryService {
   }
 
   /**
-   * Запис точки телеметрії (з Машиною станів, валідацією артефактів, ZUPT та Dead Reckoning)
+   * Запис точки телеметрії (з Машиною станів, валідацією артефактів, ZUPT, Dead Reckoning та GPS-фільтром)
    */
   async recordPoint({
     speed = 0,
@@ -127,7 +132,6 @@ class TelemetryService {
     } else {
       this.lastValidGyroZ = inputGyroZ;
     }
-
     let cleanGyroZ = validGyroZ;
 
     // Машина станів та логіка ZUPT
@@ -159,7 +163,7 @@ class TelemetryService {
     let dt = 0;
     if (this.lastTimestamp !== null) {
       const calculatedDt = (currentTimestamp - this.lastTimestamp) / 1000;
-      if (calculatedDt > 0 && calculatedDt < 1.0) {
+      if (calculatedDt > 0 && calculatedDt < 3.0) { // Збільшено вікно валідності dt до 3.0 секунд
         dt = calculatedDt;
       }
     }
@@ -172,7 +176,6 @@ class TelemetryService {
         this.currentHeading += 360;
       }
     }
-
     this.lastTimestamp = currentTimestamp;
 
     // Розрахунок відносної висоти
@@ -206,6 +209,46 @@ class TelemetryService {
     this.posX += distance * Math.sin(headingRad);
     this.posY += distance * Math.cos(headingRad);
 
+    // Фільтрація аномальних GPS-координат (Ground-Truth Filter)
+    let validLat = lat !== null && lat !== undefined ? Number(lat) : null;
+    let validLon = lon !== null && lon !== undefined ? Number(lon) : null;
+
+    if (validLat !== null && validLon !== null) {
+      if (this.lastLat !== null && this.lastLon !== null && this.lastGpsTimestamp !== null) {
+        const gpsDt = (currentTimestamp - this.lastGpsTimestamp) / 1000;
+        
+        if (gpsDt > 0) {
+          // Haversine formula
+          const R = 6371e3; // радіус Землі в метрах
+          const phi1 = this.lastLat * Math.PI / 180;
+          const phi2 = validLat * Math.PI / 180;
+          const deltaPhi = (validLat - this.lastLat) * Math.PI / 180;
+          const deltaLambda = (validLon - this.lastLon) * Math.PI / 180;
+
+          const a = Math.sin(deltaPhi / 2) * Math.sin(deltaPhi / 2) +
+                    Math.cos(phi1) * Math.cos(phi2) *
+                    Math.sin(deltaLambda / 2) * Math.sin(deltaLambda / 2);
+          const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+          const gpsDistance = R * c;
+
+          const gpsSpeed = gpsDistance / gpsDt;
+
+          if (gpsSpeed > 50) { // Якщо швидкість > 50 м/с (180 км/год)
+            validLat = null;
+            validLon = null;
+          } else {
+            this.lastLat = validLat;
+            this.lastLon = validLon;
+            this.lastGpsTimestamp = currentTimestamp;
+          }
+        }
+      } else {
+        this.lastLat = validLat;
+        this.lastLon = validLon;
+        this.lastGpsTimestamp = currentTimestamp;
+      }
+    }
+
     const entry = {
       id: `${currentTimestamp}_${Math.random().toString(36).substring(2, 8)}`,
       currentState: this.currentState,
@@ -226,8 +269,8 @@ class TelemetryService {
       pressure: rawPressure,
       posX: this.posX,
       posY: this.posY,
-      lat: lat !== null && lat !== undefined ? Number(lat) : null,
-      lon: lon !== null && lon !== undefined ? Number(lon) : null,
+      lat: validLat,
+      lon: validLon,
       timestamp: currentTimestamp,
       createdAt: new Date(currentTimestamp).toISOString(),
     };
@@ -258,10 +301,12 @@ class TelemetryService {
     if (this.isSyncing) {
       return { success: false, reason: 'already_syncing' };
     }
+
     if (!this.firestoreDb) {
       console.error('[SYNC_ERROR] Firestore DB не ініціалізовано. Перевірте виклик telemetry.init(db)');
       return { success: false, reason: 'firestore_not_initialized' };
     }
+
     if (this.memoryBuffer.length === 0) {
       return { success: true, count: 0 };
     }
@@ -296,8 +341,8 @@ class TelemetryService {
 
       const sentIds = new Set(chunk.map((i) => i.id));
       this.memoryBuffer = this.memoryBuffer.filter((i) => !sentIds.has(i.id));
-
       await this._saveToStorage();
+
       console.log(`[Telemetry] Успішно відправлено: ${chunk.length}. Залишилось у буфері: ${this.memoryBuffer.length}`);
       return { success: true, count: chunk.length, remaining: this.memoryBuffer.length };
     } catch (error) {
@@ -321,4 +366,3 @@ class TelemetryService {
 
 export const telemetry = new TelemetryService();
 export default telemetry;
-

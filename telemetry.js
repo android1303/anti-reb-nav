@@ -5,6 +5,8 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 const STORAGE_KEY = '@anti_reb_telemetry_buffer_v1';
 const SYNC_INTERVAL_MS = 30000; // 30 секунд
 const MAX_BATCH_SIZE = 450; // Безпечний ліміт для batch у Firestore (макс. 500)
+const LPF_ALPHA = 0.2; // Коефіцієнт згладжування Low-Pass Filter
+const GYRO_MAX_LIMIT = 200; // Поріг фільтрації апаратних артефактів
 
 class TelemetryService {
   constructor() {
@@ -14,6 +16,31 @@ class TelemetryService {
     this.firestoreDb = null;
     this.collectionName = 'telemetry_logs';
     this.onBufferChangeCallback = null;
+
+    // Машина станів та ZUPT
+    this.currentState = 'STOPPED';
+    this.gyroZBias = 0;
+    this.biasSamplesCount = 0;
+    this.lastValidGyroZ = 0;
+
+    // Стан фільтрації акселерометра
+    this.filteredAccelX = 0;
+    this.filteredAccelY = 0;
+    this.filteredAccelZ = 0;
+
+    // Курс та часові позначки
+    this.currentHeading = 0; // Курс у градусах [0, 360)
+    this.lastTimestamp = null;
+    this.previousSpeed = 0;
+
+    // Стан реверсу та барометричної висоти
+    this.isReversing = false;
+    this.basePressure = null;
+    this.relativeAltitude = 0;
+
+    // Навігаційне ядро (Dead Reckoning)
+    this.posX = 0;
+    this.posY = 0;
   }
 
   /**
@@ -28,7 +55,6 @@ class TelemetryService {
     }
     this.firestoreDb = db;
     this.collectionName = collectionName;
-
     await this._loadFromStorage();
     this.startAutoSync();
   }
@@ -69,23 +95,141 @@ class TelemetryService {
   }
 
   /**
-   * Запис точки телеметрії (з підтримкою осей гіроскопа та акселерометра)
+   * Запис точки телеметрії (з Машиною станів, валідацією артефактів, ZUPT та Dead Reckoning)
    */
-  async recordPoint({ speed, gyroX = 0, gyroY = 0, gyroZ = 0, accelX = 0, accelY = 0, accelZ = 0, pressure, lat = null, lon = null, timestamp = Date.now() }) {
+  async recordPoint({
+    speed = 0,
+    gyroX = 0,
+    gyroY = 0,
+    gyroZ = 0,
+    accelX = 0,
+    accelY = 0,
+    accelZ = 0,
+    pressure = 0,
+    lat = null,
+    lon = null,
+    timestamp = Date.now(),
+  }) {
+    const rawSpeed = typeof speed === 'number' ? speed : Number(speed) || 0;
+    const rawGyroX = typeof gyroX === 'number' ? gyroX : Number(gyroX) || 0;
+    const rawGyroY = typeof gyroY === 'number' ? gyroY : Number(gyroY) || 0;
+    let inputGyroZ = typeof gyroZ === 'number' ? gyroZ : Number(gyroZ) || 0;
+    let rawAccelX = typeof accelX === 'number' ? accelX : Number(accelX) || 0;
+    let rawAccelY = typeof accelY === 'number' ? accelY : Number(accelY) || 0;
+    const rawAccelZ = typeof accelZ === 'number' ? accelZ : Number(accelZ) || 0;
+    const rawPressure = typeof pressure === 'number' ? pressure : Number(pressure) || 0;
+    const currentTimestamp = Number(timestamp) || Date.now();
+
+    // Фільтрація апаратних артефактів гіроскопа
+    let validGyroZ = inputGyroZ;
+    if (Math.abs(inputGyroZ) > GYRO_MAX_LIMIT) {
+      validGyroZ = this.lastValidGyroZ;
+    } else {
+      this.lastValidGyroZ = inputGyroZ;
+    }
+
+    let cleanGyroZ = validGyroZ;
+
+    // Машина станів та логіка ZUPT
+    if (rawSpeed === 0) {
+      this.currentState = 'STOPPED';
+      // Примусове скидання лінійних прискорень
+      rawAccelX = 0;
+      rawAccelY = 0;
+      this.filteredAccelX = 0;
+      this.filteredAccelY = 0;
+      // Ковзне середнє зміщення гіроскопа
+      this.gyroZBias = ((this.gyroZBias * this.biasSamplesCount) + validGyroZ) / (this.biasSamplesCount + 1);
+      this.biasSamplesCount++;
+      // Очищене значення для нерухомого стану
+      cleanGyroZ = 0;
+    } else {
+      this.currentState = 'MOVING';
+      this.biasSamplesCount = 0;
+      // Компенсація дрейфу
+      cleanGyroZ = validGyroZ - this.gyroZBias;
+    }
+
+    // Low-Pass Filter для акселерометра
+    this.filteredAccelX = LPF_ALPHA * rawAccelX + (1 - LPF_ALPHA) * this.filteredAccelX;
+    this.filteredAccelY = LPF_ALPHA * rawAccelY + (1 - LPF_ALPHA) * this.filteredAccelY;
+    this.filteredAccelZ = LPF_ALPHA * rawAccelZ + (1 - LPF_ALPHA) * this.filteredAccelZ;
+
+    // Розрахунок інтервалу часу dt
+    let dt = 0;
+    if (this.lastTimestamp !== null) {
+      const calculatedDt = (currentTimestamp - this.lastTimestamp) / 1000;
+      if (calculatedDt > 0 && calculatedDt < 1.0) {
+        dt = calculatedDt;
+      }
+    }
+
+    // КРОК Г: Розрахунок курсу (Heading Integration)
+    if (dt > 0) {
+      const deltaHeading = (cleanGyroZ * (180 / Math.PI)) * dt;
+      this.currentHeading = (this.currentHeading + deltaHeading) % 360;
+      if (this.currentHeading < 0) {
+        this.currentHeading += 360;
+      }
+    }
+
+    this.lastTimestamp = currentTimestamp;
+
+    // Розрахунок відносної висоти
+    if (this.basePressure === null && rawPressure > 0) {
+      this.basePressure = rawPressure;
+    }
+    if (rawPressure > 0 && this.basePressure !== null) {
+      this.relativeAltitude = (this.basePressure - rawPressure) * 8.3;
+    }
+
+    // КРОК Д: Детекція реверсу
+    const isTransitionToMoving = this.previousSpeed === 0 && rawSpeed > 0;
+    if (isTransitionToMoving) {
+      if (this.filteredAccelY < -0.1) {
+        this.isReversing = true;
+      } else {
+        this.isReversing = false;
+      }
+    } else if (rawSpeed === 0) {
+      this.isReversing = false;
+    }
+    this.previousSpeed = rawSpeed;
+
+    // Навігаційне ядро (Dead Reckoning 2D)
+    let velocity_ms = rawSpeed / 3.6;
+    if (this.isReversing) {
+      velocity_ms *= -1;
+    }
+    const distance = velocity_ms * dt;
+    const headingRad = this.currentHeading * (Math.PI / 180);
+    this.posX += distance * Math.sin(headingRad);
+    this.posY += distance * Math.cos(headingRad);
+
     const entry = {
-      id: `${timestamp}_${Math.random().toString(36).substring(2, 8)}`,
-      speed: typeof speed === 'number' ? speed : Number(speed) || 0,
-      gyroX: typeof gyroX === 'number' ? gyroX : Number(gyroX) || 0,
-      gyroY: typeof gyroY === 'number' ? gyroY : Number(gyroY) || 0,
-      gyroZ: typeof gyroZ === 'number' ? gyroZ : Number(gyroZ) || 0,
-      accelX: typeof accelX === 'number' ? accelX : Number(accelX) || 0,
-      accelY: typeof accelY === 'number' ? accelY : Number(accelY) || 0,
-      accelZ: typeof accelZ === 'number' ? accelZ : Number(accelZ) || 0,
-      pressure: typeof pressure === 'number' ? pressure : Number(pressure) || 0,
+      id: `${currentTimestamp}_${Math.random().toString(36).substring(2, 8)}`,
+      currentState: this.currentState,
+      speed: rawSpeed,
+      gyroX: rawGyroX,
+      gyroY: rawGyroY,
+      gyroZ: cleanGyroZ,
+      cleanGyroZ: cleanGyroZ,
+      accelX: rawAccelX,
+      accelY: rawAccelY,
+      accelZ: rawAccelZ,
+      filteredAccelX: this.filteredAccelX,
+      filteredAccelY: this.filteredAccelY,
+      filteredAccelZ: this.filteredAccelZ,
+      heading: this.currentHeading,
+      isReversing: this.isReversing,
+      altitude: this.relativeAltitude,
+      pressure: rawPressure,
+      posX: this.posX,
+      posY: this.posY,
       lat: lat !== null && lat !== undefined ? Number(lat) : null,
       lon: lon !== null && lon !== undefined ? Number(lon) : null,
-      timestamp: Number(timestamp) || Date.now(),
-      createdAt: new Date(timestamp).toISOString(),
+      timestamp: currentTimestamp,
+      createdAt: new Date(currentTimestamp).toISOString(),
     };
 
     this.memoryBuffer.push(entry);
@@ -114,17 +258,14 @@ class TelemetryService {
     if (this.isSyncing) {
       return { success: false, reason: 'already_syncing' };
     }
-
     if (!this.firestoreDb) {
       console.error('[SYNC_ERROR] Firestore DB не ініціалізовано. Перевірте виклик telemetry.init(db)');
       return { success: false, reason: 'firestore_not_initialized' };
     }
-
     if (this.memoryBuffer.length === 0) {
       return { success: true, count: 0 };
     }
 
-    // Перевірка наявності зв'язку через NetInfo
     let isConnected = false;
     try {
       const netState = await NetInfo.fetch();
@@ -153,11 +294,10 @@ class TelemetryService {
       console.log(`[Telemetry] Спроба відправки batch (${chunk.length} записів) у Firestore...`);
       await batch.commit();
 
-      // Успішне вивантаження: видаляємо відправлені записи з локального буфера
       const sentIds = new Set(chunk.map((i) => i.id));
       this.memoryBuffer = this.memoryBuffer.filter((i) => !sentIds.has(i.id));
-      await this._saveToStorage();
 
+      await this._saveToStorage();
       console.log(`[Telemetry] Успішно відправлено: ${chunk.length}. Залишилось у буфері: ${this.memoryBuffer.length}`);
       return { success: true, count: chunk.length, remaining: this.memoryBuffer.length };
     } catch (error) {
@@ -181,3 +321,4 @@ class TelemetryService {
 
 export const telemetry = new TelemetryService();
 export default telemetry;
+

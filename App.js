@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Switch, Platform, StatusBar, PermissionsAndroid, Alert } from 'react-native';
+import {
+  StyleSheet,
+  View,
+  Text,
+  TouchableOpacity,
+  Switch,
+  Platform,
+  StatusBar,
+  PermissionsAndroid,
+  Alert,
+  DeviceEventEmitter,
+} from 'react-native';
 import * as Location from 'expo-location';
 import { Barometer, Gyroscope, Accelerometer } from 'expo-sensors';
 import obdScanner from './obdScanner'; // Наш новий нативний міст
@@ -20,21 +31,21 @@ export default function App() {
 
   const [isRecording, setIsRecording] = useState(false);
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
-  const [rawObd, setRawObd] = useState('Система готова до запуску'); 
+  const [rawObd, setRawObd] = useState('Система готова до запуску');
 
-  // Додано поля для сирих даних гіроскопа та акселерометра (X, Y, Z) у реф, щоб не перевантажувати UI
-  const latestData = useRef({ 
-    speed: 0, 
-    heading: 0, 
-    pressure: 0, 
-    lat: null, 
-    lon: null, 
-    gyroX: 0, 
-    gyroY: 0, 
+  // Дані сенсорів смартфона та GPS у рефі, щоб не перевантажувати UI
+  const latestData = useRef({
+    speed: 0,
+    heading: 0,
+    pressure: 0,
+    lat: null,
+    lon: null,
+    gyroX: 0,
+    gyroY: 0,
     gyroZ: 0,
     accelX: 0,
     accelY: 0,
-    accelZ: 0
+    accelZ: 0,
   });
 
   useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
@@ -65,21 +76,39 @@ export default function App() {
     return () => { isMounted = false; };
   }, []);
 
-  // Таймер запису телеметрії
+  // Високочастотний запис телеметрії (20 Гц) через Event Listener від нативного модуля
   useEffect(() => {
-    let interval;
+    let subscription = null;
+
     if (isRecording) {
-      interval = setInterval(async () => {
+      subscription = DeviceEventEmitter.addListener('ON_ELM_DATA', async (event) => {
         try {
-          await telemetry.recordPoint(latestData.current);
+          // Захист від збоїв: перевірка на null/undefined
+          if (!event || typeof event !== 'object') {
+            return;
+          }
+
+          // Об'єднуємо payload від нативного модуля (speed, апаратний timestamp) з контекстом сенсорів
+          const telemetryPayload = {
+            ...latestData.current,
+            ...event,
+          };
+
+          await telemetry.recordPoint(telemetryPayload);
           setBufferCount(telemetry.getBufferSize());
         } catch (err) {
-          console.error('Помилка запису:', err);
+          console.error('[Telemetry] Помилка запису точки з Event Listener:', err);
         }
-      }, 1000); 
+      });
     }
-    return () => { if (interval) clearInterval(interval); };
-  }, [isRecording]); 
+
+    return () => {
+      if (subscription) {
+        subscription.remove();
+        subscription = null;
+      }
+    };
+  }, [isRecording]);
 
   // Барометр
   useEffect(() => {
@@ -100,13 +129,13 @@ export default function App() {
     return () => { if (baroSubscription) baroSubscription.remove(); };
   }, []);
 
-  // Високочастотний Гіроскоп (Сирі дані для аналізу маневрів)
+  // Високочастотний Гіроскоп (20 Гц)
   useEffect(() => {
     let gyroSubscription;
     const startGyroscope = async () => {
       try {
         if (await Gyroscope.isAvailableAsync()) {
-          Gyroscope.setUpdateInterval(50); // 50 мс = 20 Гц для детального інерційного профілю
+          Gyroscope.setUpdateInterval(50);
           gyroSubscription = Gyroscope.addListener(data => {
             latestData.current.gyroX = data.x;
             latestData.current.gyroY = data.y;
@@ -121,13 +150,13 @@ export default function App() {
     return () => { if (gyroSubscription) gyroSubscription.remove(); };
   }, []);
 
-  // Високочастотний Акселерометр (Сирі дані для векторів прискорення)
+  // Високочастотний Акселерометр (20 Гц)
   useEffect(() => {
     let accelSubscription;
-    const startлогиАкселерометра = async () => {
+    const startAccelerometer = async () => {
       try {
         if (await Accelerometer.isAvailableAsync()) {
-          Accelerometer.setUpdateInterval(50); // 50 мс = 20 Гц синхронно з гіроскопом
+          Accelerometer.setUpdateInterval(50);
           accelSubscription = Accelerometer.addListener(data => {
             latestData.current.accelX = data.x;
             latestData.current.accelY = data.y;
@@ -138,11 +167,11 @@ export default function App() {
         console.warn('Акселерометр недоступний:', e);
       }
     };
-    startлогиАкселерометра();
+    startAccelerometer();
     return () => { if (accelSubscription) accelSubscription.remove(); };
   }, []);
 
-  // GPS
+  // Еталонний GPS (Ground Truth)
   useEffect(() => {
     let locSubscription;
     (async () => {
@@ -168,7 +197,7 @@ export default function App() {
     return () => { if (locSubscription) locSubscription.remove(); };
   }, [isGpsEnabled]);
 
-  // Bluetooth (НОВА ЛОГІКА ЧЕРЕЗ NATIVE MODULE)
+  // Bluetooth підключення через Native Module
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -283,7 +312,6 @@ export default function App() {
         <Text style={styles.recordBtnText}>{isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}</Text>
       </TouchableOpacity>
 
-      {/* ВЕРСІЯ БІЛДА */}
       <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 15, marginBottom: 10 }}>
         Білд: {obdScanner.getVersion()}
       </Text>

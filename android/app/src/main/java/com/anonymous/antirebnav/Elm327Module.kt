@@ -24,7 +24,6 @@ class Elm327Module(reactContext: ReactApplicationContext) : ReactContextBaseJava
     }
 
     // --- ОБОВ'ЯЗКОВІ МЕТОДИ ДЛЯ NativeEventEmitter ---
-    // Якщо їх не буде, React Native видасть фатальну помилку при підписці на події
     @ReactMethod
     fun addListener(eventName: String) {
         // Залишаємо порожнім
@@ -37,9 +36,23 @@ class Elm327Module(reactContext: ReactApplicationContext) : ReactContextBaseJava
     // -------------------------------------------------
 
     private fun sendEvent(eventName: String, data: String) {
-        reactApplicationContext
-            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit(eventName, data)
+        try {
+            reactApplicationContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit(eventName, data)
+        } catch (e: Exception) {
+            Log.e(TAG, "Помилка відправки події $eventName: ", e)
+        }
+    }
+
+    private fun sendEvent(eventName: String, params: WritableMap) {
+        try {
+            reactApplicationContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit(eventName, params)
+        } catch (e: Exception) {
+            Log.e(TAG, "Помилка відправки події $eventName: ", e)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -52,6 +65,10 @@ class Elm327Module(reactContext: ReactApplicationContext) : ReactContextBaseJava
 
         try {
             val btAdapter = BluetoothAdapter.getDefaultAdapter()
+            if (btAdapter == null) {
+                promise.reject("CONNECT_ERROR", "Bluetooth адаптер недоступний")
+                return
+            }
             val device: BluetoothDevice = btAdapter.getRemoteDevice(macAddress)
 
             // НАШ БУЛЬДОЗЕР: РЕФЛЕКСІЯ для обходу блокувань Android 13+
@@ -83,8 +100,16 @@ class Elm327Module(reactContext: ReactApplicationContext) : ReactContextBaseJava
                 try {
                     bytes = inputStream?.read(buffer) ?: 0
                     if (bytes > 0) {
-                        val data = String(buffer, 0, bytes)
-                        sendEvent("ON_ELM_DATA", data)
+                        val rawData = String(buffer, 0, bytes)
+                        val hardwareTimestamp = System.currentTimeMillis().toDouble()
+
+                        // Формування payload з апаратним часом для ядра Dead Reckoning
+                        val params: WritableMap = Arguments.createMap().apply {
+                            putString("data", rawData)
+                            putDouble("timestamp", hardwareTimestamp)
+                        }
+
+                        sendEvent("ON_ELM_DATA", params)
                     }
                 } catch (e: Exception) {
                     Log.e(TAG, "Розрив потоку читання", e)

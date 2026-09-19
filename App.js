@@ -13,7 +13,7 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import { Barometer, Gyroscope, Accelerometer } from 'expo-sensors';
-import obdScanner from './obdScanner'; // Наш новий нативний міст
+import obdScanner from './obdScanner'; // Наш нативний міст
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
@@ -33,7 +33,7 @@ export default function App() {
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску');
 
-  // Дані сенсорів смартфона та GPS у рефі, щоб не перевантажувати UI
+  // Дані сенсорів смартфона та GPS у рефі, щоб уникнути перерендерингу UI
   const latestData = useRef({
     speed: 0,
     heading: 0,
@@ -76,37 +76,39 @@ export default function App() {
     return () => { isMounted = false; };
   }, []);
 
-  // Високочастотний запис телеметрії (20 Гц) через Event Listener від нативного модуля
+  // Єдиний контур обробки подій OBD (Single Pipeline, 20 Гц)
   useEffect(() => {
-    let subscription = null;
+    const subscription = DeviceEventEmitter.addListener('ON_ELM_DATA', async (event) => {
+      try {
+        // Захист від збоїв: перевірка наявності об'єкта
+        if (!event || typeof event !== 'object') {
+          return;
+        }
 
-    if (isRecording) {
-      subscription = DeviceEventEmitter.addListener('ON_ELM_DATA', async (event) => {
-        try {
-          // Захист від збоїв: перевірка на null/undefined
-          if (!event || typeof event !== 'object') {
-            return;
-          }
+        // 1. Єдине джерело правди: оновлення швидкості в UI
+        const parsedSpeed = typeof event.speed === 'number' && !isNaN(event.speed)
+          ? event.speed
+          : Number(event.speed) || 0;
+        setCurrentSpeed(parsedSpeed);
 
-          // Об'єднуємо payload від нативного модуля (speed, апаратний timestamp) з контекстом сенсорів
+        // 2. Ізоляція телеметрії: надсилання точки в Dead Reckoning тільки під час запису
+        if (isRecording) {
           const telemetryPayload = {
             ...latestData.current,
             ...event,
+            speed: parsedSpeed,
           };
 
           await telemetry.recordPoint(telemetryPayload);
           setBufferCount(telemetry.getBufferSize());
-        } catch (err) {
-          console.error('[Telemetry] Помилка запису точки з Event Listener:', err);
         }
-      });
-    }
+      } catch (err) {
+        console.error('[Telemetry] Помилка обробки події ON_ELM_DATA:', err);
+      }
+    });
 
     return () => {
-      if (subscription) {
-        subscription.remove();
-        subscription = null;
-      }
+      subscription.remove();
     };
   }, [isRecording]);
 
@@ -218,10 +220,8 @@ export default function App() {
 
       if (connected) {
         setIsBluetoothConnected(true);
-        obdScanner.startReadingSpeed(
-          (speed) => setCurrentSpeed(speed),
-          (status) => setRawObd(status)
-        );
+        // Запуск сканера лише з callback статусу
+        obdScanner.startReadingSpeed((status) => setRawObd(status));
       } else {
         setIsBluetoothConnected(false);
         setRawObd('Помилка з\'єднання');
@@ -275,11 +275,11 @@ export default function App() {
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>RAW (ДЕБАГ)</Text>
-          <Text style={[styles.cardValueSmall, {color: '#facc15'}]} numberOfLines={3}>{rawObd}</Text>
+          <Text style={[styles.cardValueSmall, { color: '#facc15' }]} numberOfLines={3}>{rawObd}</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ТИСК (BARO)</Text>
-          <Text style={styles.cardValue}>{currentPressure ? currentPressure.toFixed(1) : 0} <Text style={{fontSize: 16}}>hPa</Text></Text>
+          <Text style={styles.cardValue}>{currentPressure ? currentPressure.toFixed(1) : 0} <Text style={{ fontSize: 16 }}>hPa</Text></Text>
           <Text style={styles.cardSub}>Висотомір</Text>
         </View>
         <View style={styles.card}>
@@ -308,7 +308,10 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      <TouchableOpacity style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]} onPress={() => setIsRecording(!isRecording)}>
+      <TouchableOpacity
+        style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]}
+        onPress={() => setIsRecording(!isRecording)}
+      >
         <Text style={styles.recordBtnText}>{isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}</Text>
       </TouchableOpacity>
 

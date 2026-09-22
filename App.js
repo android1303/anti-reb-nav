@@ -9,11 +9,10 @@ import {
   StatusBar,
   PermissionsAndroid,
   Alert,
-  DeviceEventEmitter,
 } from 'react-native';
 import * as Location from 'expo-location';
 import { Barometer, Gyroscope, Accelerometer } from 'expo-sensors';
-import obdScanner from './obdScanner'; // Наш нативний міст
+import obdScanner from './obdScanner';
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
@@ -33,7 +32,13 @@ export default function App() {
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску');
 
-  // Дані сенсорів смартфона та GPS у рефі, щоб уникнути перерендерингу UI
+  // Реф для зберігання актуального стану запису без втрати контексту в асинхронних колбеках
+  const isRecordingRef = useRef(false);
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  // Сенсорний стек смартфона та ground-truth GPS
   const latestData = useRef({
     speed: 0,
     heading: 0,
@@ -55,7 +60,7 @@ export default function App() {
     latestData.current.lon = location?.coords?.longitude || null;
   }, [location]);
 
-  // Безпечна ініціалізація телеметрії
+  // Ініціалізація сервісу телеметрії
   useEffect(() => {
     let isMounted = true;
     const initApp = async () => {
@@ -76,50 +81,14 @@ export default function App() {
     return () => { isMounted = false; };
   }, []);
 
-  // Єдиний контур обробки подій OBD (Single Pipeline, 20 Гц)
-  useEffect(() => {
-    const subscription = DeviceEventEmitter.addListener('ON_ELM_DATA', async (event) => {
-      try {
-        // Захист від збоїв: перевірка наявності об'єкта
-        if (!event || typeof event !== 'object') {
-          return;
-        }
-
-        // 1. Єдине джерело правди: оновлення швидкості в UI
-        const parsedSpeed = typeof event.speed === 'number' && !isNaN(event.speed)
-          ? event.speed
-          : Number(event.speed) || 0;
-        setCurrentSpeed(parsedSpeed);
-
-        // 2. Ізоляція телеметрії: надсилання точки в Dead Reckoning тільки під час запису
-        if (isRecording) {
-          const telemetryPayload = {
-            ...latestData.current,
-            ...event,
-            speed: parsedSpeed,
-          };
-
-          await telemetry.recordPoint(telemetryPayload);
-          setBufferCount(telemetry.getBufferSize());
-        }
-      } catch (err) {
-        console.error('[Telemetry] Помилка обробки події ON_ELM_DATA:', err);
-      }
-    });
-
-    return () => {
-      subscription.remove();
-    };
-  }, [isRecording]);
-
-  // Барометр
+  // Барометр (1 Гц)
   useEffect(() => {
     Barometer.setUpdateInterval(1000);
     let baroSubscription;
     const startBarometer = async () => {
       try {
         if (await Barometer.isAvailableAsync()) {
-          baroSubscription = Barometer.addListener(data => {
+          baroSubscription = Barometer.addListener((data) => {
             setCurrentPressure(data.pressure);
           });
         }
@@ -131,14 +100,14 @@ export default function App() {
     return () => { if (baroSubscription) baroSubscription.remove(); };
   }, []);
 
-  // Високочастотний Гіроскоп (20 Гц)
+  // Гіроскоп (20 Гц / 50 мс)
   useEffect(() => {
     let gyroSubscription;
     const startGyroscope = async () => {
       try {
         if (await Gyroscope.isAvailableAsync()) {
           Gyroscope.setUpdateInterval(50);
-          gyroSubscription = Gyroscope.addListener(data => {
+          gyroSubscription = Gyroscope.addListener((data) => {
             latestData.current.gyroX = data.x;
             latestData.current.gyroY = data.y;
             latestData.current.gyroZ = data.z;
@@ -152,14 +121,14 @@ export default function App() {
     return () => { if (gyroSubscription) gyroSubscription.remove(); };
   }, []);
 
-  // Високочастотний Акселерометр (20 Гц)
+  // Акселерометр (20 Гц / 50 мс)
   useEffect(() => {
     let accelSubscription;
     const startAccelerometer = async () => {
       try {
         if (await Accelerometer.isAvailableAsync()) {
           Accelerometer.setUpdateInterval(50);
-          accelSubscription = Accelerometer.addListener(data => {
+          accelSubscription = Accelerometer.addListener((data) => {
             latestData.current.accelX = data.x;
             latestData.current.accelY = data.y;
             latestData.current.accelZ = data.z;
@@ -199,7 +168,7 @@ export default function App() {
     return () => { if (locSubscription) locSubscription.remove(); };
   }, [isGpsEnabled]);
 
-  // Bluetooth підключення через Native Module
+  // Підключення та єдиний пайплайн читання швидкості
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -220,11 +189,33 @@ export default function App() {
 
       if (connected) {
         setIsBluetoothConnected(true);
-        // Запуск сканера лише з callback статусу
-        obdScanner.startReadingSpeed((status) => setRawObd(status));
+
+        // Єдиний контур: обробка швидкості та апаратного таймстемпу
+        obdScanner.startReadingSpeed(
+          async (speed, timestamp) => {
+            const parsedSpeed = typeof speed === 'number' && !isNaN(speed) ? speed : 0;
+            setCurrentSpeed(parsedSpeed);
+
+            if (isRecordingRef.current) {
+              try {
+                const telemetryPayload = {
+                  ...latestData.current,
+                  speed: parsedSpeed,
+                  timestamp: timestamp,
+                };
+
+                await telemetry.recordPoint(telemetryPayload);
+                setBufferCount(telemetry.getBufferSize());
+              } catch (err) {
+                console.error('[Telemetry] Помилка запису точки:', err);
+              }
+            }
+          },
+          (status) => setRawObd(status)
+        );
       } else {
         setIsBluetoothConnected(false);
-        setRawObd('Помилка з\'єднання');
+        setRawObd("Помилка з'єднання");
       }
     } catch (err) {
       setIsBluetoothConnected(false);
@@ -238,7 +229,9 @@ export default function App() {
       await telemetry.syncNow();
       setBufferCount(telemetry.getBufferSize());
       const now = new Date();
-      setLastSyncTime(`${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`);
+      setLastSyncTime(
+        `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
+      );
     } catch (e) {
       setSyncError(true);
     }
@@ -249,7 +242,7 @@ export default function App() {
     const result = await exportFirestoreToCSV(db);
     setIsExporting(false);
     if (!result.success) {
-      Alert.alert("Помилка експорту", result.error);
+      Alert.alert('Помилка експорту', result.error);
     }
   };
 
@@ -258,7 +251,10 @@ export default function App() {
       <View style={styles.header}>
         <Text style={styles.headerTitle}>ANTI-REB NAV</Text>
         <View style={styles.statusIcons}>
-          <TouchableOpacity onPress={connectBluetooth} style={[styles.badge, isBluetoothConnected ? styles.badgeActive : styles.badgeInactive]}>
+          <TouchableOpacity
+            onPress={connectBluetooth}
+            style={[styles.badge, isBluetoothConnected ? styles.badgeActive : styles.badgeInactive]}
+          >
             <Text style={styles.badgeText}>OBD</Text>
           </TouchableOpacity>
           <View style={[styles.badge, isGpsEnabled ? styles.badgeActive : styles.badgeInactive]}>
@@ -271,32 +267,45 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD)</Text>
           <Text style={styles.cardValue}>{currentSpeed}</Text>
-          <Text style={styles.cardSub}>{isBluetoothConnected ? "Онлайн" : "Офлайн"}</Text>
+          <Text style={styles.cardSub}>{isBluetoothConnected ? 'Онлайн' : 'Офлайн'}</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>RAW (ДЕБАГ)</Text>
-          <Text style={[styles.cardValueSmall, { color: '#facc15' }]} numberOfLines={3}>{rawObd}</Text>
+          <Text style={[styles.cardValueSmall, { color: '#facc15' }]} numberOfLines={3}>
+            {rawObd}
+          </Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ТИСК (BARO)</Text>
-          <Text style={styles.cardValue}>{currentPressure ? currentPressure.toFixed(1) : 0} <Text style={{ fontSize: 16 }}>hPa</Text></Text>
+          <Text style={styles.cardValue}>
+            {currentPressure ? currentPressure.toFixed(1) : 0} <Text style={{ fontSize: 16 }}>hPa</Text>
+          </Text>
           <Text style={styles.cardSub}>Висотомір</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>GROUND TRUTH GPS</Text>
           <Text style={styles.cardValueSmall}>
-            {location ? `${location.coords.latitude.toFixed(5)}\n${location.coords.longitude.toFixed(5)}` : 'Очікування GPS'}
+            {location
+              ? `${location.coords.latitude.toFixed(5)}\n${location.coords.longitude.toFixed(5)}`
+              : 'Очікування GPS'}
           </Text>
         </View>
       </View>
 
       <View style={styles.toggleRow}>
         <Text style={styles.toggleLabel}>Еталонний GPS</Text>
-        <Switch value={isGpsEnabled} onValueChange={setIsGpsEnabled} trackColor={{ false: "#334155", true: "#0284c7" }} thumbColor={"#fff"} />
+        <Switch
+          value={isGpsEnabled}
+          onValueChange={setIsGpsEnabled}
+          trackColor={{ false: '#334155', true: '#0284c7' }}
+          thumbColor={'#fff'}
+        />
       </View>
 
       <View style={styles.bufferInfo}>
-        <Text style={styles.bufferText}>Буфер: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}</Text>
+        <Text style={styles.bufferText}>
+          Буфер: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}
+        </Text>
       </View>
 
       <View style={styles.controlsRow}>
@@ -312,7 +321,7 @@ export default function App() {
         style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]}
         onPress={() => setIsRecording(!isRecording)}
       >
-        <Text style={styles.recordBtnText}>{isRecording ? "ЗУПИНИТИ ЗАПИС" : "ЗАПИС ЛОГУ"}</Text>
+        <Text style={styles.recordBtnText}>{isRecording ? 'ЗУПИНИТИ ЗАПИС' : 'ЗАПИС ЛОГУ'}</Text>
       </TouchableOpacity>
 
       <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 15, marginBottom: 10 }}>
@@ -323,29 +332,147 @@ export default function App() {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#0a0f1c', paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight + 10 : 40, paddingHorizontal: 15 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 },
-  headerTitle: { color: '#38bdf8', fontSize: 20, fontWeight: '900', letterSpacing: 1 },
-  statusIcons: { flexDirection: 'row', gap: 10 },
-  badge: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1 },
-  badgeInactive: { borderColor: '#334155', backgroundColor: '#1e293b' },
-  badgeActive: { borderColor: '#0ea5e9', backgroundColor: '#0284c7' },
-  badgeText: { color: 'white', fontSize: 12, fontWeight: 'bold' },
-  grid: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', marginBottom: 10 },
-  card: { backgroundColor: '#151c2c', width: '48%', padding: 15, borderRadius: 10, marginBottom: 15, borderWidth: 1, borderColor: '#222f47' },
-  cardLabel: { color: '#94a3b8', fontSize: 11, fontWeight: 'bold', marginBottom: 5 },
-  cardValue: { color: 'white', fontSize: 28, fontWeight: 'bold' },
-  cardValueSmall: { color: '#38bdf8', fontSize: 13, fontWeight: 'bold', lineHeight: 18 },
-  cardSub: { color: '#64748b', fontSize: 11, marginTop: 5 },
-  toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#151c2c', padding: 15, borderRadius: 10, marginBottom: 20, borderWidth: 1, borderColor: '#222f47' },
-  toggleLabel: { color: 'white', fontSize: 14, fontWeight: 'bold' },
-  bufferInfo: { backgroundColor: '#151c2c', padding: 12, borderRadius: 8, alignItems: 'center', marginBottom: 20 },
-  bufferText: { color: '#38bdf8', fontWeight: 'bold' },
-  controlsRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 15 },
-  syncBtn: { backgroundColor: '#1c2539', paddingVertical: 12, flex: 0.48, alignItems: 'center', justifyContent: 'center', borderRadius: 8, borderWidth: 1, borderColor: '#334155' },
-  syncBtnText: { color: 'white', fontWeight: 'bold', textAlign: 'center', fontSize: 12 },
-  recordBtn: { paddingVertical: 18, borderRadius: 10, alignItems: 'center' },
-  recordBtnInactive: { backgroundColor: '#dc2626' },
-  recordBtnActive: { backgroundColor: '#16a34a' },
-  recordBtnText: { color: 'white', fontSize: 18, fontWeight: 'bold', letterSpacing: 1 },
+  container: {
+    flex: 1,
+    backgroundColor: '#0a0f1c',
+    paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight + 10 : 40,
+    paddingHorizontal: 15,
+  },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  headerTitle: {
+    color: '#38bdf8',
+    fontSize: 20,
+    fontWeight: '900',
+    letterSpacing: 1,
+  },
+  statusIcons: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+  },
+  badgeInactive: {
+    borderColor: '#334155',
+    backgroundColor: '#1e293b',
+  },
+  badgeActive: {
+    borderColor: '#0ea5e9',
+    backgroundColor: '#0284c7',
+  },
+  badgeText: {
+    color: 'white',
+    fontSize: 12,
+    fontWeight: 'bold',
+  },
+  grid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  card: {
+    backgroundColor: '#151c2c',
+    width: '48%',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: '#222f47',
+  },
+  cardLabel: {
+    color: '#94a3b8',
+    fontSize: 11,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  cardValue: {
+    color: 'white',
+    fontSize: 28,
+    fontWeight: 'bold',
+  },
+  cardValueSmall: {
+    color: '#38bdf8',
+    fontSize: 13,
+    fontWeight: 'bold',
+    lineHeight: 18,
+  },
+  cardSub: {
+    color: '#64748b',
+    fontSize: 11,
+    marginTop: 5,
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#151c2c',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#222f47',
+  },
+  toggleLabel: {
+    color: 'white',
+    fontSize: 14,
+    fontWeight: 'bold',
+  },
+  bufferInfo: {
+    backgroundColor: '#151c2c',
+    padding: 12,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  bufferText: {
+    color: '#38bdf8',
+    fontWeight: 'bold',
+  },
+  controlsRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 15,
+  },
+  syncBtn: {
+    backgroundColor: '#1c2539',
+    paddingVertical: 12,
+    flex: 0.48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  syncBtnText: {
+    color: 'white',
+    fontWeight: 'bold',
+    textAlign: 'center',
+    fontSize: 12,
+  },
+  recordBtn: {
+    paddingVertical: 18,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  recordBtnInactive: {
+    backgroundColor: '#dc2626',
+  },
+  recordBtnActive: {
+    backgroundColor: '#16a34a',
+  },
+  recordBtnText: {
+    color: 'white',
+    fontSize: 18,
+    fontWeight: 'bold',
+    letterSpacing: 1,
+  },
 });

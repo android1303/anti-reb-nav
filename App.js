@@ -11,7 +11,7 @@ import {
   Alert,
 } from 'react-native';
 import * as Location from 'expo-location';
-import { Barometer, Gyroscope, Accelerometer } from 'expo-sensors';
+import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
@@ -32,12 +32,6 @@ export default function App() {
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску');
 
-  // Реф для зберігання актуального стану запису без втрати контексту в асинхронних колбеках
-  const isRecordingRef = useRef(false);
-  useEffect(() => {
-    isRecordingRef.current = isRecording;
-  }, [isRecording]);
-
   // Сенсорний стек смартфона та ground-truth GPS
   const latestData = useRef({
     speed: 0,
@@ -53,8 +47,14 @@ export default function App() {
     accelZ: 0,
   });
 
-  useEffect(() => { latestData.current.speed = currentSpeed; }, [currentSpeed]);
-  useEffect(() => { latestData.current.pressure = currentPressure; }, [currentPressure]);
+  useEffect(() => {
+    latestData.current.speed = currentSpeed;
+  }, [currentSpeed]);
+
+  useEffect(() => {
+    latestData.current.pressure = currentPressure;
+  }, [currentPressure]);
+
   useEffect(() => {
     latestData.current.lat = location?.coords?.latitude || null;
     latestData.current.lon = location?.coords?.longitude || null;
@@ -78,8 +78,33 @@ export default function App() {
       }
     };
     initApp();
-    return () => { isMounted = false; };
+    return () => {
+      isMounted = false;
+    };
   }, []);
+
+  // Крок 2: Розподіл частот (Decoupling) — запис телеметрії на жорстких 20 Гц (50 мс)
+  useEffect(() => {
+    let interval;
+    if (isRecording) {
+      interval = setInterval(async () => {
+        try {
+          // Зріз найсвіжіших даних сенсорів із таймстемпом поточної ітерації
+          const payload = {
+            ...latestData.current,
+            timestamp: Date.now(),
+          };
+          await telemetry.recordPoint(payload);
+          setBufferCount(telemetry.getBufferSize());
+        } catch (err) {
+          console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
+        }
+      }, 50); // Жорсткі 20 Гц
+    }
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [isRecording]);
 
   // Барометр (1 Гц)
   useEffect(() => {
@@ -97,7 +122,9 @@ export default function App() {
       }
     };
     startBarometer();
-    return () => { if (baroSubscription) baroSubscription.remove(); };
+    return () => {
+      if (baroSubscription) baroSubscription.remove();
+    };
   }, []);
 
   // Гіроскоп (20 Гц / 50 мс)
@@ -118,28 +145,34 @@ export default function App() {
       }
     };
     startGyroscope();
-    return () => { if (gyroSubscription) gyroSubscription.remove(); };
+    return () => {
+      if (gyroSubscription) gyroSubscription.remove();
+    };
   }, []);
 
-  // Акселерометр (20 Гц / 50 мс)
+  // Крок 1: Заміна Accelerometer на DeviceMotion (Лінійне прискорення без гравітації Землі 1G)
   useEffect(() => {
-    let accelSubscription;
-    const startAccelerometer = async () => {
+    let motionSubscription;
+    const startDeviceMotion = async () => {
       try {
-        if (await Accelerometer.isAvailableAsync()) {
-          Accelerometer.setUpdateInterval(50);
-          accelSubscription = Accelerometer.addListener((data) => {
-            latestData.current.accelX = data.x;
-            latestData.current.accelY = data.y;
-            latestData.current.accelZ = data.z;
+        if (await DeviceMotion.isAvailableAsync()) {
+          DeviceMotion.setUpdateInterval(50); // 50 мс = 20 Гц
+          motionSubscription = DeviceMotion.addListener((data) => {
+            if (data?.acceleration) {
+              latestData.current.accelX = data.acceleration.x || 0;
+              latestData.current.accelY = data.acceleration.y || 0;
+              latestData.current.accelZ = data.acceleration.z || 0;
+            }
           });
         }
       } catch (e) {
-        console.warn('Акселерометр недоступний:', e);
+        console.warn('DeviceMotion недоступний:', e);
       }
     };
-    startAccelerometer();
-    return () => { if (accelSubscription) accelSubscription.remove(); };
+    startDeviceMotion();
+    return () => {
+      if (motionSubscription) motionSubscription.remove();
+    };
   }, []);
 
   // Еталонний GPS (Ground Truth)
@@ -165,10 +198,12 @@ export default function App() {
         setIsGpsEnabled(false);
       }
     })();
-    return () => { if (locSubscription) locSubscription.remove(); };
+    return () => {
+      if (locSubscription) locSubscription.remove();
+    };
   }, [isGpsEnabled]);
 
-  // Підключення та єдиний пайплайн читання швидкості
+  // Підключення OBD — лише асинхронне оновлення швидкості (без виклику телеметрії)
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -190,26 +225,11 @@ export default function App() {
       if (connected) {
         setIsBluetoothConnected(true);
 
-        // Єдиний контур: обробка швидкості та апаратного таймстемпу
         obdScanner.startReadingSpeed(
-          async (speed, timestamp) => {
+          (speed) => {
             const parsedSpeed = typeof speed === 'number' && !isNaN(speed) ? speed : 0;
             setCurrentSpeed(parsedSpeed);
-
-            if (isRecordingRef.current) {
-              try {
-                const telemetryPayload = {
-                  ...latestData.current,
-                  speed: parsedSpeed,
-                  timestamp: timestamp,
-                };
-
-                await telemetry.recordPoint(telemetryPayload);
-                setBufferCount(telemetry.getBufferSize());
-              } catch (err) {
-                console.error('[Telemetry] Помилка запису точки:', err);
-              }
-            }
+            latestData.current.speed = parsedSpeed; // Лише актуалізація зліпку швидкості
           },
           (status) => setRawObd(status)
         );

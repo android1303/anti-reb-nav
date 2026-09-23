@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v14)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v15)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -15,6 +15,15 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  *  5. Зберігання: порції по 5 с у файли (без ліміту AsyncStorage),
  *     у Firestore одна порція = один документ.
  *  6. У лог пишуться сирі дані сенсорів — заїзд можна «програти» повторно.
+ *
+ * Зміни v15 (фікс аудиту):
+ *  7. isStopped/ZUPT більше не залежить виключно від свіжості OBD:
+ *     при втраті зв'язку нерухомість визначається по акселерометру й
+ *     гіроскопу (ACCEL_STILL_MAX / GYRO_STILL_MAX_DEG), тож калібрування
+ *     дрейфу гіроскопа не зупиняється через Bluetooth-глюк.
+ *  8. Короткі розриви OBD (<OBD_EXTRAPOLATE_MAX_MS) під час руху більше не
+ *     "заморожують" позицію — DR тримає останню відому швидкість
+ *     (speedExtrapolated=true в лозі, щоб Архітектор бачив ці ділянки).
  * ===================================================================== */
 
 const RAD2DEG = 180 / Math.PI;
@@ -40,14 +49,21 @@ const MAX_BIAS_BUFFER = 50; // 2.5 с при 20 Гц
 const ZUPT_MIN_SAMPLES = 20; // мінімум 1 с нерухомості до оновлення bias
 const ZUPT_MAX_STD_DEG = 0.5; // град/с; більше — телефон не в спокої
 
+// --- Незалежна від OBD детекція нерухомості (акселерометр+гіроскоп) ---
+// Дозволяє калібрувати ZUPT навіть коли Bluetooth OBD відвалився
+// (Android 13+ IOException), а не лише коли швидкість формально "0".
+const ACCEL_STILL_MAX = 0.4; // м/с²; лінійне прискорення (без гравітації) в спокої
+const GYRO_STILL_MAX_DEG = 3; // град/с; миттєвий поріг обертання в спокої
+
 // --- OBD / час ---
 const OBD_STALE_MS = 2000; // дані швидкості старші за це вважаються втраченими
+const OBD_EXTRAPOLATE_MAX_MS = 1000; // короткий Bluetooth-глюк: тримаємо останню швидкість
 const MAX_DT_S = 1.0;
 
 // Колонки CSV (порядок = порядок у файлі)
 export const CSV_COLUMNS = [
   'timestamp', 'createdAt', 'sessionId', 'currentState', 'dt',
-  'speedRaw', 'speedUsed', 'obdAgeMs', 'obdFresh',
+  'speedRaw', 'speedUsed', 'speedExtrapolated', 'obdAgeMs', 'obdFresh',
   'gyroXRaw', 'gyroYRaw', 'gyroZRaw',
   'accelX', 'accelY', 'accelZ', 'gravX', 'gravY', 'gravZ', 'gravityValid',
   'yawRateRaw', 'yawRateValid', 'gyroBias', 'yawRateClean', 'zuptStd', 'zuptApplied',
@@ -72,6 +88,13 @@ const stdDev = (arr) => {
   const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
   const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / arr.length;
   return Math.sqrt(variance);
+};
+
+/** Екранування значення для CSV-комірки (кома/лапки/переніс рядка) */
+export const csvCell = (v) => {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
 class TelemetryService {
@@ -211,9 +234,6 @@ class TelemetryService {
     const pressureRaw = num(pressure);
 
     const obdFresh = Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_STALE_MS;
-    // Без свіжого OBD швидкість невідома -> позицію не рухаємо (прапорець у лозі)
-    const speedUsed = obdFresh ? speedRaw * SPEED_SCALE_FACTOR : 0;
-    const isStopped = obdFresh && speedRaw === 0;
 
     // --- 1. dt ---
     let dt = 0;
@@ -263,6 +283,14 @@ class TelemetryService {
       this.lastValidYaw = yawRateRaw;
     }
 
+    // --- 5b. isStopped: якщо OBD свіжий — довіряємо йому; якщо ні — визначаємо
+    // нерухомість незалежно, по акселерометру й гіроскопу. Це критично для ZUPT:
+    // калібрування дрейфу гіроскопа не повинно зупинятись через Bluetooth-глюк
+    // (IOException на Android 13+), інакше похибка курсу накопичується мовчки.
+    const accelMag = Math.hypot(this.filteredAccelX, this.filteredAccelY, this.filteredAccelZ);
+    const looksStationary = accelMag < ACCEL_STILL_MAX && Math.abs(yawRateValid) < GYRO_STILL_MAX_DEG;
+    const isStopped = obdFresh ? speedRaw === 0 : looksStationary;
+
     // --- 6. Машина станів + ZUPT ---
     let yawRateClean;
     let zuptStd = null;
@@ -307,6 +335,19 @@ class TelemetryService {
       this.relativeAltitude = (this.basePressure - pressureRaw) * 8.3;
     }
 
+    // --- 8b. Швидкість для DR: свіжий OBD -> довіряємо; короткий розрив (<1с,
+    // не РЕБ, а Bluetooth-глюк) -> тримаємо останню відому швидкість, щоб не
+    // "заморожувати" позицію під час реального руху; довший розрив або
+    // підтверджена нерухомість -> 0.
+    let speedUsed = 0;
+    let speedExtrapolated = false;
+    if (obdFresh) {
+      speedUsed = speedRaw * SPEED_SCALE_FACTOR;
+    } else if (!isStopped && Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_EXTRAPOLATE_MAX_MS) {
+      speedUsed = this.previousSpeed * SPEED_SCALE_FACTOR;
+      speedExtrapolated = true;
+    }
+
     // --- 9. Детекція реверсу (на момент рушання) ---
     if (isStopped) {
       this.isReversing = false;
@@ -335,6 +376,7 @@ class TelemetryService {
       dt,
       speedRaw,
       speedUsed,
+      speedExtrapolated,
       obdAgeMs: Number.isFinite(obdAgeMs) ? obdAgeMs : -1,
       obdFresh,
       gyroXRaw: gX,
@@ -530,9 +572,7 @@ class TelemetryService {
         try {
           const data = JSON.parse(await FileSystem.readAsStringAsync(path));
           for (const p of data.points || []) {
-            lines.push(
-              CSV_COLUMNS.map((c) => (p[c] === null || p[c] === undefined ? '' : p[c])).join(',')
-            );
+            lines.push(CSV_COLUMNS.map((c) => csvCell(p[c])).join(','));
           }
         } catch (e) {
           console.warn('[Telemetry] Пропущено файл при експорті:', path);

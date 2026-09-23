@@ -1,7 +1,7 @@
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import { collection, getDocs, query, orderBy, where } from 'firebase/firestore';
-import { CSV_COLUMNS } from './telemetry';
+import { CSV_COLUMNS, csvCell } from './telemetry';
 
 /* =====================================================================
  * Експорт з Firebase у CSV (v14)
@@ -16,12 +16,6 @@ import { CSV_COLUMNS } from './telemetry';
  * мають інший зміст (gyroZ там уже очищений, у рад/с), тож змішувати
  * їх з новими даними не можна.
  * ===================================================================== */
-
-const csvCell = (v) => {
-  if (v === null || v === undefined) return '';
-  const s = String(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-};
 
 async function writeAndShare(csvString, fileName) {
   const fileUri = FileSystem.cacheDirectory + fileName;

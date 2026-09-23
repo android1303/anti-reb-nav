@@ -229,6 +229,10 @@ export default function App() {
           setRawObd('Немає дозволу BLUETOOTH_CONNECT');
           return;
         }
+        if (granted['android.permission.BLUETOOTH_SCAN'] !== PermissionsAndroid.RESULTS.GRANTED) {
+          setRawObd('Немає дозволу BLUETOOTH_SCAN');
+          return;
+        }
       }
 
       setRawObd('Підключення через Native Module...');
@@ -318,7 +322,11 @@ export default function App() {
     setIsExporting(true);
     try {
       const result = await exportFirestoreToCSV(db);
-      if (!result.success) Alert.alert('Помилка експорту з хмари', result.error);
+      if (!result.success) {
+        Alert.alert('Помилка експорту з хмари', result.error);
+      } else {
+        Alert.alert('Експорт з хмари завершено', `Рядків: ${result.rows}`);
+      }
     } finally {
       setIsExporting(false);
     }

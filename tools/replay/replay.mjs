@@ -7,7 +7,7 @@
  * За замовчуванням ядро = ./telemetry.js, вихід = replay_out.csv.
  * Щоб перевірити інші константи — скопіюй telemetry.js у тимчасовий файл,
  * зміни константу і передай його третім аргументом.
- * Потрібен devDependency esbuild. Далі: python3 tools/replay/compare.py replay_out.csv
+ * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
 import { readFileSync, writeFileSync, unlinkSync } from 'node:fs';

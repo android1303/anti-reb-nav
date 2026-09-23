@@ -21,7 +21,7 @@
 **Необов'язково: автоматизація через GitHub (рівень 2)**
 1. У Claude Code виконати `/install-github-app` (потрібні права адміністратора репозиторію). Для роботи GitHub Action потрібна автентифікація — API-ключ Anthropic або токен підписки; актуальні варіанти — у документації Claude Code GitHub Actions.
 2. Після цього TASK можна вставляти в GitHub Issue (шаблон «TASK від Архітектора») і писати коментар `@claude виконай цей TASK за правилами CLAUDE.md`. Claude відкриє PR; ти переглядаєш і зливаєш.
-3. Workflow збірки APK у GitHub Actions — запуск на push у `main`, APK як артефакт збірки.
+3. Збірка APK — автоматично на push у main при зміні коду (фільтр paths у build-android.yml) або вручну (Run workflow); APK — як артефакт збірки.
 
 ## 2. Робочий цикл
 

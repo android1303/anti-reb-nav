@@ -2,7 +2,7 @@
 """
 Порівняння траєкторії Dead Reckoning з еталонним GPS.
 
-  python3 tools/replay/compare.py <файл.csv> [--align-m 280] [--plot out.png]
+  python3 (Windows: python) tools/replay/compare.py <файл.csv> [--align-m 280] [--plot out.png]
 
 Працює і з логом з телефону, і з виходом replay.mjs (потрібні posX, posY, lat, lon, timestamp).
 Методика (Master Plan, розд. 5): траєкторія DR вирівнюється з GPS жорстким поворотом+зсувом

@@ -46,6 +46,10 @@
 - Один TASK = один коміт (або PR). Повідомлення: `TASK-<номер>: <суть>`.
 - Не комітити секрети, `node_modules`, згенеровані APK. Сирі CSV заїздів у git не комітяться (репозиторій публічний, у CSV GPS-трек); локально вони лежать у field_tests/data/ (в ігнорі).
 
+## Push
+
+Push входить у кожен TASK. Після коміту: git fetch origin; git merge-base --is-ancestor origin/main HEAD — якщо так, git push і вказати в REPORT діапазон (було..стало); якщо ні — зупинитись, нічого не об'єднувати, у REPORT показати git log --oneline origin/main -5 і git diff --stat origin/main HEAD. Заборонено: git push --force, git reset --hard, git rebase без явної вказівки в TASK. Якщо змінено файли з фільтра paths у build-android.yml — у REPORT написати, що збірка запуститься автоматично.
+
 ## Звіт після кожного завдання
 
 Завжди завершуй роботу блоком коду, який Андрій передасть Архітектору без правок:

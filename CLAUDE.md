@@ -27,9 +27,10 @@
 
 - Будь-яка зміна `telemetry.js` → відтворення на всіх заїздах із `field_tests/data/` (якщо є) до і після:
   ```
-  node tools/replay/replay.mjs <заїзд.csv> /tmp/replay.csv
-  python3 tools/replay/compare.py /tmp/replay.csv
+  node tools/replay/replay.mjs field_tests/data/<заїзд.csv> replay_tmp.csv
+  python tools/replay/compare.py replay_tmp.csv
   ```
+  На Windows — python, на Linux/macOS — python3. replay_tmp.csv не комітити (*.csv в .gitignore). Залежності: npm install; python -m pip install --user numpy pandas.
   Результати (кінцева похибка, RMS) — у REPORT. Якщо похибка зросла, а TASK цього не передбачав — зупинись і повідом.
 - Синтаксис/збірка JS: `npx esbuild <файл> --bundle=false` або повна збірка, якщо доступна.
 - Нові npm-пакети з нативним кодом — через `npx expo install <пакет>` (правильна версія для SDK 57).
@@ -43,7 +44,7 @@
 ## Коміти
 
 - Один TASK = один коміт (або PR). Повідомлення: `TASK-<номер>: <суть>`.
-- Не комітити секрети, `node_modules`, згенеровані APK. Сирі CSV заїздів — лише в `field_tests/data/`, якщо Андрій так вирішив.
+- Не комітити секрети, `node_modules`, згенеровані APK. Сирі CSV заїздів у git не комітяться (репозиторій публічний, у CSV GPS-трек); локально вони лежать у field_tests/data/ (в ігнорі).
 
 ## Звіт після кожного завдання
 

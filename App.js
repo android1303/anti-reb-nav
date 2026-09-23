@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
+import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
 import telemetry from './telemetry';
@@ -113,6 +114,12 @@ export default function App() {
       }
     }, 50);
     return () => clearInterval(interval);
+  }, [isRecording]);
+
+  // Екран не гасне під час запису: інакше Android душить JS-таймери 20 Гц
+  useEffect(() => {
+    if (isRecording) activateKeepAwakeAsync('recording').catch(() => {});
+    else deactivateKeepAwake('recording').catch(() => {});
   }, [isRecording]);
 
   // Оновлення UI 2 Гц (курс, позиція, буфер, стан OBD)
@@ -291,6 +298,7 @@ export default function App() {
         offline: 'НЕМАЄ МЕРЕЖІ',
         firestore_not_initialized: 'FIREBASE ВИМК.',
         already_syncing: 'ЗАЧЕКАЙТЕ...',
+        recording: 'ЗУПИНІТЬ ЗАПИС',
       };
       setSyncError(reasons[result.reason] || 'ПОМИЛКА');
     }

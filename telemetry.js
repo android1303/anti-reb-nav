@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v15)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v16)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -24,6 +24,27 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  *  8. Короткі розриви OBD (<OBD_EXTRAPOLATE_MAX_MS) під час руху більше не
  *     "заморожують" позицію — DR тримає останню відому швидкість
  *     (speedExtrapolated=true в лозі, щоб Архітектор бачив ці ділянки).
+ *
+ * Зміни v16 (за результатами польового тесту, Вишгород, 1.38 км):
+ *  9. Скасовано п.7: детекція нерухомості по миттєвих порогах accel/gyro
+ *     не відрізняє стоянку від руху з постійною швидкістю по прямій —
+ *     у тесті при розриві OBD на 22 км/год ядро оголосило STOPPED,
+ *     заморозило курс і обнулило швидкість. ZUPT тепер знову лише при
+ *     свіжому OBD зі швидкістю 0; розрив OBD = стан OBD_LOST.
+ * 10. Виправлено п.8: екстраполяція вмикалась при obdAgeMs <= 1000, але
+ *     obdFresh=false лише після 2000 мс — умова ніколи не виконувалась.
+ *     Тепер: 2000..5000 мс -> тримаємо останню швидкість, >5000 мс -> 0.
+ * 11. ZUPT: у тесті розкид гіроскопа на зупинках 0.56–2.2 °/с (вібрація
+ *     двигуна), поріг 0.5 не пропустив жодної зупинки. Але відтворення
+ *     заїзду показало: короткі зупинки (2–5 с) дають оцінки bias від
+ *     −0.4 до +0.9 °/с, а для точності потрібно ±0.02 °/с (помилка 0.1 °/с
+ *     = 100–200 м на цьому маршруті). Тому bias оцінюється лише на
+ *     стоянках ≥10 с (після 1 с «заспокоєння»), усереднюється між
+ *     стоянками з вагою за кількістю зразків. Поріг розкиду 2.5 °/с.
+ * 12. Паузи потоку JS 1–5 с: позиція доінтегровується з останньою
+ *     швидкістю (у тесті пауза 2.6 с «з'їла» 16 м). Колонка gapS.
+ * 13. Синхронізація з Firestore блокувала потік JS (паузи кожні 30 с,
+ *     до 2.6 с) — під час запису вимкнена, запускається після stopSession.
  * ===================================================================== */
 
 const RAD2DEG = 180 / Math.PI;
@@ -45,24 +66,22 @@ const GYRO_MAX_LIMIT_DEG = 150; // град/с; авто так швидко н�
 const MIN_GRAVITY_NORM = 5; // м/с²; менше — вектор гравітації ще не отримано
 
 // --- ZUPT ---
-const MAX_BIAS_BUFFER = 50; // 2.5 с при 20 Гц
-const ZUPT_MIN_SAMPLES = 20; // мінімум 1 с нерухомості до оновлення bias
-const ZUPT_MAX_STD_DEG = 0.5; // град/с; більше — телефон не в спокої
-
-// --- Незалежна від OBD детекція нерухомості (акселерометр+гіроскоп) ---
-// Дозволяє калібрувати ZUPT навіть коли Bluetooth OBD відвалився
-// (Android 13+ IOException), а не лише коли швидкість формально "0".
-const ACCEL_STILL_MAX = 0.4; // м/с²; лінійне прискорення (без гравітації) в спокої
-const GYRO_STILL_MAX_DEG = 3; // град/с; миттєвий поріг обертання в спокої
+const MAX_BIAS_BUFFER = 1200; // до 60 с стоянки при 20 Гц
+const ZUPT_SETTLE_SAMPLES = 20; // перша 1 с зупинки не йде в bias (авто ще докочується,
+                                // OBD показує 0 вже нижче ~2 км/год)
+const ZUPT_MIN_SAMPLES = 200; // оцінка bias лише після 10 с стоянки
+const ZUPT_MAX_STD_DEG = 2.5; // град/с; у тесті на зупинках 0.56–2.2 (вібрація двигуна)
+const BIAS_WEIGHT_CAP = 2400; // макс. «пам'ять» bias у зразках (~2 хв стоянок)
 
 // --- OBD / час ---
 const OBD_STALE_MS = 2000; // дані швидкості старші за це вважаються втраченими
-const OBD_EXTRAPOLATE_MAX_MS = 1000; // короткий Bluetooth-глюк: тримаємо останню швидкість
-const MAX_DT_S = 1.0;
+const OBD_EXTRAPOLATE_MAX_MS = 5000; // OBD_STALE_MS..це значення: тримаємо останню швидкість
+const MAX_DT_S = 1.0; // нормальний крок інтеграції
+const GAP_FILL_MAX_S = 5.0; // паузи JS до 5 с: позицію доінтегровуємо з останньою швидкістю
 
 // Колонки CSV (порядок = порядок у файлі)
 export const CSV_COLUMNS = [
-  'timestamp', 'createdAt', 'sessionId', 'currentState', 'dt',
+  'timestamp', 'createdAt', 'sessionId', 'currentState', 'dt', 'gapS',
   'speedRaw', 'speedUsed', 'speedExtrapolated', 'obdAgeMs', 'obdFresh',
   'gyroXRaw', 'gyroYRaw', 'gyroZRaw',
   'accelX', 'accelY', 'accelZ', 'gravX', 'gravY', 'gravZ', 'gravityValid',
@@ -109,6 +128,7 @@ class TelemetryService {
     this.syncTimer = null;
     this.isFlushing = false;
     this.isSyncing = false;
+    this.isRecording = false;
     this.sessionId = null;
 
     this.resetNavigation();
@@ -119,7 +139,11 @@ class TelemetryService {
     this.currentState = 'STOPPED';
 
     // ZUPT
-    this.gyroBias = 0; // град/с
+    this.gyroBias = 0; // град/с — поточна оцінка (з урахуванням поточної зупинки)
+    this.committedBias = 0; // bias, накопичений за попередні зупинки
+    this.committedWeight = 0; // його вага в зразках
+    this.stopEstimateN = 0; // скільки зразків дала поточна зупинка (0 = оцінки ще немає)
+    this.stopSamples = 0; // скільки тиків триває поточна зупинка
     this.biasBuffer = [];
     this.lastValidYaw = 0;
 
@@ -190,6 +214,7 @@ class TelemetryService {
   // ------------------------------------------------------------------
 
   startSession() {
+    this.isRecording = true;
     this.resetNavigation();
     this.pendingPoints = [];
     this.sessionId = `s_${Date.now()}`;
@@ -199,11 +224,14 @@ class TelemetryService {
   }
 
   async stopSession() {
+    this.isRecording = false;
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
     await this.flush();
+    // Синхронізація лише після запису: під час запису вона блокує потік JS
+    if (this.firestoreDb) this.syncNow().catch(() => {});
   }
 
   // ------------------------------------------------------------------
@@ -236,10 +264,14 @@ class TelemetryService {
     const obdFresh = Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_STALE_MS;
 
     // --- 1. dt ---
+    // dt — крок для курсу та позиції; gapS — пауза потоку JS (1..5 с), яку
+    // доінтегровуємо лише для позиції (даних гіроскопа за паузу немає).
     let dt = 0;
+    let gapS = 0;
     if (this.lastTimestamp !== null) {
       const calc = (timestamp - this.lastTimestamp) / 1000;
       if (calc > 0 && calc < MAX_DT_S) dt = calc;
+      else if (calc >= MAX_DT_S && calc <= GAP_FILL_MAX_S) gapS = calc;
     }
     this.lastTimestamp = timestamp;
 
@@ -283,13 +315,12 @@ class TelemetryService {
       this.lastValidYaw = yawRateRaw;
     }
 
-    // --- 5b. isStopped: якщо OBD свіжий — довіряємо йому; якщо ні — визначаємо
-    // нерухомість незалежно, по акселерометру й гіроскопу. Це критично для ZUPT:
-    // калібрування дрейфу гіроскопа не повинно зупинятись через Bluetooth-глюк
-    // (IOException на Android 13+), інакше похибка курсу накопичується мовчки.
-    const accelMag = Math.hypot(this.filteredAccelX, this.filteredAccelY, this.filteredAccelZ);
-    const looksStationary = accelMag < ACCEL_STILL_MAX && Math.abs(yawRateValid) < GYRO_STILL_MAX_DEG;
-    const isStopped = obdFresh ? speedRaw === 0 : looksStationary;
+    // --- 5b. isStopped — ЛИШЕ за свіжим OBD.
+    // Миттєві пороги accel/gyro не відрізняють стоянку від руху з постійною
+    // швидкістю по прямій (лінійне прискорення ≈ 0, поворотів немає).
+    // Хибний STOPPED у русі заморожує курс і, що гірше, записує в bias
+    // дані з руху. Тому при розриві OBD — стан OBD_LOST, ZUPT не працює.
+    const isStopped = obdFresh && speedRaw === 0;
 
     // --- 6. Машина станів + ZUPT ---
     let yawRateClean;
@@ -304,13 +335,22 @@ class TelemetryService {
       this.filteredAccelY = 0;
       this.filteredAccelZ = 0;
 
-      this.biasBuffer.push(yawRateValid);
-      if (this.biasBuffer.length > MAX_BIAS_BUFFER) this.biasBuffer.shift();
+      this.stopSamples += 1;
+      if (this.stopSamples > ZUPT_SETTLE_SAMPLES) {
+        this.biasBuffer.push(yawRateValid);
+        if (this.biasBuffer.length > MAX_BIAS_BUFFER) this.biasBuffer.shift();
+      }
 
       if (this.biasBuffer.length >= ZUPT_MIN_SAMPLES) {
         zuptStd = stdDev(this.biasBuffer);
         if (zuptStd <= ZUPT_MAX_STD_DEG) {
-          this.gyroBias = median(this.biasBuffer);
+          // Зважене усереднення з попередніми зупинками: коротка стоянка з
+          // шумом ±2 °/с дає грубу оцінку, тож не перезаписуємо bias повністю.
+          const n = this.biasBuffer.length;
+          const est = median(this.biasBuffer);
+          this.gyroBias =
+            (this.committedBias * this.committedWeight + est * n) / (this.committedWeight + n);
+          this.stopEstimateN = n;
           zuptApplied = true;
         }
       }
@@ -318,7 +358,17 @@ class TelemetryService {
       yawRateClean = 0; // авто на місці не повертає
     } else {
       this.currentState = obdFresh ? 'MOVING' : 'OBD_LOST';
-      if (this.biasBuffer.length) this.biasBuffer = [];
+      // Кінець зупинки: фіксуємо оцінку bias у «пам'ять»
+      this.stopSamples = 0;
+      if (this.biasBuffer.length) {
+        if (this.stopEstimateN > 0) {
+          this.committedBias = this.gyroBias;
+          this.committedWeight = Math.min(this.committedWeight + this.stopEstimateN, BIAS_WEIGHT_CAP);
+        }
+        this.gyroBias = this.committedBias;
+        this.stopEstimateN = 0;
+        this.biasBuffer = [];
+      }
       // Курс інтегруємо навіть при втраті OBD — поворот не можна пропускати
       yawRateClean = yawRateValid - this.gyroBias;
     }
@@ -335,15 +385,15 @@ class TelemetryService {
       this.relativeAltitude = (this.basePressure - pressureRaw) * 8.3;
     }
 
-    // --- 8b. Швидкість для DR: свіжий OBD -> довіряємо; короткий розрив (<1с,
-    // не РЕБ, а Bluetooth-глюк) -> тримаємо останню відому швидкість, щоб не
-    // "заморожувати" позицію під час реального руху; довший розрив або
-    // підтверджена нерухомість -> 0.
+    // --- 8b. Швидкість для DR:
+    //   obdAgeMs <= 2000        -> свіжий OBD, довіряємо
+    //   2000 < obdAgeMs <= 5000 -> розрив, тримаємо останню відому швидкість
+    //   obdAgeMs > 5000         -> швидкість невідома, 0
     let speedUsed = 0;
     let speedExtrapolated = false;
     if (obdFresh) {
       speedUsed = speedRaw * SPEED_SCALE_FACTOR;
-    } else if (!isStopped && Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_EXTRAPOLATE_MAX_MS) {
+    } else if (Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_EXTRAPOLATE_MAX_MS) {
       speedUsed = this.previousSpeed * SPEED_SCALE_FACTOR;
       speedExtrapolated = true;
     }
@@ -363,7 +413,7 @@ class TelemetryService {
     // --- 10. Dead Reckoning 2D ---
     let v = speedUsed / 3.6;
     if (this.isReversing) v = -v;
-    const distance = v * dt;
+    const distance = v * (dt + gapS);
     const hRad = this.currentHeading * (Math.PI / 180);
     this.posX += distance * Math.sin(hRad);
     this.posY += distance * Math.cos(hRad);
@@ -374,6 +424,7 @@ class TelemetryService {
       sessionId: this.sessionId,
       currentState: this.currentState,
       dt,
+      gapS,
       speedRaw,
       speedUsed,
       speedExtrapolated,
@@ -489,6 +540,8 @@ class TelemetryService {
   }
 
   async syncNow() {
+    // Під час запису синхронізація блокувала потік JS (у тесті — до 2.6 с)
+    if (this.isRecording) return { success: false, reason: 'recording' };
     if (this.isSyncing) return { success: false, reason: 'already_syncing' };
     if (!this.firestoreDb) return { success: false, reason: 'firestore_not_initialized' };
 

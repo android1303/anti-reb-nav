@@ -26,6 +26,7 @@
   "private": true,
   "devDependencies": {
     "@react-native-community/cli": "^20.2.0",
-    "@react-native/metro-config": "^0.86.3"
+    "@react-native/metro-config": "^0.86.3",
+    "esbuild": "^0.28.2"
   }
 }

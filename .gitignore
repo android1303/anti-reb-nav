@@ -38,4 +38,14 @@ yarn-error.*
 
 # generated native folders
 /ios
-/android
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties*
+
+# Metro bundle (build artifact)
+index.android.bundle
+
+# field test data (public repo: CSVs contain GPS tracks)
+field_tests/data/
+*.csv

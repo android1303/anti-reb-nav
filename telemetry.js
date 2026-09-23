@@ -1,62 +1,138 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo from '@react-native-community/netinfo';
+import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
-const STORAGE_KEY = '@anti_reb_telemetry_buffer_v1';
-const SYNC_INTERVAL_MS = 30000; // 30 секунд
-const MAX_BATCH_SIZE = 450; // Безпечний ліміт для batch у Firestore (макс. 500)
-const LPF_ALPHA = 0.2; // Коефіцієнт згладжування Low-Pass Filter
-const GYRO_MAX_LIMIT = 200; // Поріг фільтрації апаратних артефактів
-const MAX_BIAS_BUFFER = 50; // Розмір буфера медіанного фільтра ZUPT
-const GYRO_SCALE_FACTOR = 1.0; // Масштабний коефіцієнт гіроскопа
+/* =====================================================================
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v14)
+ *
+ * Зміни відносно v13:
+ *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
+ *  2. Кутова швидкість рискання = проєкція гіроскопа на вектор гравітації
+ *     (працює при будь-якому нахилі тримача).
+ *  3. ZUPT оновлює bias лише при свіжих даних OBD, достатній кількості
+ *     зразків і спокійному гіроскопі (мала дисперсія).
+ *  4. recordPoint синхронний (без гонок між тиками 20 Гц).
+ *  5. Зберігання: порції по 5 с у файли (без ліміту AsyncStorage),
+ *     у Firestore одна порція = один документ.
+ *  6. У лог пишуться сирі дані сенсорів — заїзд можна «програти» повторно.
+ * ===================================================================== */
+
+const RAD2DEG = 180 / Math.PI;
+
+// --- Зберігання та синхронізація ---
+const SYNC_INTERVAL_MS = 30000;
+const FLUSH_INTERVAL_MS = 5000; // порція = ~100 точок при 20 Гц
+const MAX_CHUNKS_PER_SYNC = 20;
+const LOG_DIR = FileSystem.documentDirectory + 'telemetry/';
+const PENDING_DIR = LOG_DIR + 'pending/';
+const SYNCED_DIR = LOG_DIR + 'synced/';
+
+// --- Константи для калібрування (Архітектор) ---
+const LPF_ALPHA = 0.2; // Low-Pass Filter акселерометра
+const YAW_SIGN = 1; // ±1: при повороті ПРАВОРУЧ heading має ЗРОСТАТИ
+const GYRO_SCALE_FACTOR = 1.0; // масштаб гіроскопа (калібрування по GPS)
+const SPEED_SCALE_FACTOR = 1.0; // спідометр OBD зазвичай завищує на 2–5%
+const GYRO_MAX_LIMIT_DEG = 150; // град/с; авто так швидко не повертає -> артефакт
+const MIN_GRAVITY_NORM = 5; // м/с²; менше — вектор гравітації ще не отримано
+
+// --- ZUPT ---
+const MAX_BIAS_BUFFER = 50; // 2.5 с при 20 Гц
+const ZUPT_MIN_SAMPLES = 20; // мінімум 1 с нерухомості до оновлення bias
+const ZUPT_MAX_STD_DEG = 0.5; // град/с; більше — телефон не в спокої
+
+// --- OBD / час ---
+const OBD_STALE_MS = 2000; // дані швидкості старші за це вважаються втраченими
+const MAX_DT_S = 1.0;
+
+// Колонки CSV (порядок = порядок у файлі)
+export const CSV_COLUMNS = [
+  'timestamp', 'createdAt', 'sessionId', 'currentState', 'dt',
+  'speedRaw', 'speedUsed', 'obdAgeMs', 'obdFresh',
+  'gyroXRaw', 'gyroYRaw', 'gyroZRaw',
+  'accelX', 'accelY', 'accelZ', 'gravX', 'gravY', 'gravZ', 'gravityValid',
+  'yawRateRaw', 'yawRateValid', 'gyroBias', 'yawRateClean', 'zuptStd', 'zuptApplied',
+  'filteredAccelX', 'filteredAccelY', 'filteredAccelZ',
+  'forwardAxis', 'forwardSign', 'isAxesCalibrated', 'isReversing',
+  'heading', 'posX', 'posY', 'pressure', 'altitude', 'lat', 'lon',
+];
+
+const num = (v) => {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+};
+
+const median = (arr) => {
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+};
+
+const stdDev = (arr) => {
+  const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+  const variance = arr.reduce((a, b) => a + (b - mean) * (b - mean), 0) / arr.length;
+  return Math.sqrt(variance);
+};
 
 class TelemetryService {
   constructor() {
-    this.memoryBuffer = [];
-    this.syncTimer = null;
-    this.isSyncing = false;
     this.firestoreDb = null;
-    this.collectionName = 'telemetry_logs';
+    this.collectionName = 'telemetry_chunks';
     this.onBufferChangeCallback = null;
 
-    // Машина станів та ZUPT
-    this.currentState = 'STOPPED';
-    this.gyroZBias = 0;
-    this.biasBuffer = []; // Буфер останніх значень validGyroZ для медіани
-    this.lastValidGyroZ = 0;
+    this.pendingPoints = []; // точки в пам'яті до наступного flush
+    this.unsyncedPoints = 0; // точки, ще не відправлені у Firestore
+    this.flushTimer = null;
+    this.syncTimer = null;
+    this.isFlushing = false;
+    this.isSyncing = false;
+    this.sessionId = null;
 
-    // Стан фільтрації акселерометра
+    this.resetNavigation();
+  }
+
+  /** Повне скидання навігаційного стану (на початку кожної сесії запису) */
+  resetNavigation() {
+    this.currentState = 'STOPPED';
+
+    // ZUPT
+    this.gyroBias = 0; // град/с
+    this.biasBuffer = [];
+    this.lastValidYaw = 0;
+
+    // Акселерометр
     this.filteredAccelX = 0;
     this.filteredAccelY = 0;
     this.filteredAccelZ = 0;
 
-    // Курс та часові позначки
-    this.currentHeading = 0; // Курс у градусах [0, 360)
+    // Вісь руху (для детекції реверсу)
+    this.forwardAxis = 'y';
+    this.forwardSign = 1;
+    this.isAxesCalibrated = false;
+
+    // Курс / час
+    this.currentHeading = 0; // [0, 360), відносно початкового напрямку
     this.lastTimestamp = null;
     this.previousSpeed = 0;
 
-    // Стан реверсу та барометричної висоти
+    // Реверс / висота
     this.isReversing = false;
     this.basePressure = null;
     this.relativeAltitude = 0;
 
-    // Навігаційне ядро (Dead Reckoning)
+    // Dead Reckoning
     this.posX = 0;
     this.posY = 0;
   }
 
-  /**
-   * Ініціалізація сервісу телеметрії
-   */
-  async init(db, collectionName = 'telemetry_logs') {
-    if (!db) {
-      console.error('[SYNC_ERROR] Передано невалідний або пустий інстанс Firestore DB у telemetry.init()');
-      return;
-    }
+  /** db може бути null — тоді працює лише локальне зберігання (режим РЕБ) */
+  async init(db = null, collectionName = 'telemetry_chunks') {
     this.firestoreDb = db;
     this.collectionName = collectionName;
-    await this._loadFromStorage();
-    this.startAutoSync();
+    await this._ensureDirs();
+    this.unsyncedPoints = await this._countPendingPoints();
+    this._notifyBufferChange();
+    if (db) this.startAutoSync();
   }
 
   setOnBufferChange(callback) {
@@ -65,209 +141,302 @@ class TelemetryService {
 
   _notifyBufferChange() {
     if (typeof this.onBufferChangeCallback === 'function') {
-      this.onBufferChangeCallback(this.memoryBuffer.length);
+      this.onBufferChangeCallback(this.unsyncedPoints);
     }
   }
 
-  async _loadFromStorage() {
-    try {
-      const raw = await AsyncStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          this.memoryBuffer = parsed;
-        }
-      }
-    } catch (err) {
-      console.warn('[Telemetry] Помилка завантаження локального буфера:', err);
-      this.memoryBuffer = [];
-    }
-    this._notifyBufferChange();
+  getBufferSize() {
+    return this.unsyncedPoints;
   }
 
-  async _saveToStorage() {
-    try {
-      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(this.memoryBuffer));
-    } catch (err) {
-      console.error('[Telemetry] Помилка запису в AsyncStorage:', err);
-    }
-    this._notifyBufferChange();
+  getNavState() {
+    return {
+      state: this.currentState,
+      heading: this.currentHeading,
+      posX: this.posX,
+      posY: this.posY,
+      gyroBias: this.gyroBias,
+      isAxesCalibrated: this.isAxesCalibrated,
+      isReversing: this.isReversing,
+      altitude: this.relativeAltitude,
+    };
   }
 
-  /**
-   * Запис точки телеметрії (з Машиною станів, медіанним ZUPT та Dead Reckoning)
-   */
-  async recordPoint({
+  // ------------------------------------------------------------------
+  // Сесія запису
+  // ------------------------------------------------------------------
+
+  startSession() {
+    this.resetNavigation();
+    this.pendingPoints = [];
+    this.sessionId = `s_${Date.now()}`;
+    if (this.flushTimer) clearInterval(this.flushTimer);
+    this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+    return this.sessionId;
+  }
+
+  async stopSession() {
+    if (this.flushTimer) {
+      clearInterval(this.flushTimer);
+      this.flushTimer = null;
+    }
+    await this.flush();
+  }
+
+  // ------------------------------------------------------------------
+  // Ядро: одна точка 20 Гц (СИНХРОННО)
+  // ------------------------------------------------------------------
+
+  recordPoint({
     speed = 0,
-    gyroX = 0,
-    gyroY = 0,
-    gyroZ = 0,
-    accelX = 0,
-    accelY = 0,
-    accelZ = 0,
+    obdAgeMs = Infinity,
+    gyroX = 0, gyroY = 0, gyroZ = 0, // рад/с (expo-sensors)
+    accelX = 0, accelY = 0, accelZ = 0,
+    gravX = 0, gravY = 0, gravZ = 0,
     pressure = 0,
     lat = null,
     lon = null,
     timestamp,
   }) {
-    // Жорстка перевірка наявності апаратного таймстемпу з нативного шару Kotlin
-    if (timestamp === undefined || timestamp === null || typeof timestamp !== 'number' || isNaN(timestamp)) {
-      console.warn('[Telemetry] Відхилено точку: timestamp відсутній або невалідний (має надходити виключно з нативного шару Kotlin).');
+    if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
+      console.warn('[Telemetry] Відхилено точку: невалідний timestamp.');
       return null;
     }
 
-    const currentTimestamp = timestamp;
+    // --- 0. Вхідні дані ---
+    const speedRaw = num(speed);
+    const gX = num(gyroX), gY = num(gyroY), gZ = num(gyroZ);
+    let aX = num(accelX), aY = num(accelY), aZ = num(accelZ);
+    const grX = num(gravX), grY = num(gravY), grZ = num(gravZ);
+    const pressureRaw = num(pressure);
 
-    // Валідація числових параметрів сенсорів
-    const rawSpeed = typeof speed === 'number' && !isNaN(speed) ? speed : Number(speed) || 0;
-    const rawGyroX = typeof gyroX === 'number' && !isNaN(gyroX) ? gyroX : Number(gyroX) || 0;
-    const rawGyroY = typeof gyroY === 'number' && !isNaN(gyroY) ? gyroY : Number(gyroY) || 0;
-    let inputGyroZ = typeof gyroZ === 'number' && !isNaN(gyroZ) ? gyroZ : Number(gyroZ) || 0;
-    let rawAccelX = typeof accelX === 'number' && !isNaN(accelX) ? accelX : Number(accelX) || 0;
-    let rawAccelY = typeof accelY === 'number' && !isNaN(accelY) ? accelY : Number(accelY) || 0;
-    const rawAccelZ = typeof accelZ === 'number' && !isNaN(accelZ) ? accelZ : Number(accelZ) || 0;
-    const rawPressure = typeof pressure === 'number' && !isNaN(pressure) ? pressure : Number(pressure) || 0;
+    const obdFresh = Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_STALE_MS;
+    // Без свіжого OBD швидкість невідома -> позицію не рухаємо (прапорець у лозі)
+    const speedUsed = obdFresh ? speedRaw * SPEED_SCALE_FACTOR : 0;
+    const isStopped = obdFresh && speedRaw === 0;
 
-    // 1. Фільтрація апаратних артефактів гіроскопа (GYRO_MAX_LIMIT)
-    let validGyroZ = inputGyroZ;
-    if (Math.abs(inputGyroZ) > GYRO_MAX_LIMIT) {
-      validGyroZ = this.lastValidGyroZ;
-    } else {
-      this.lastValidGyroZ = inputGyroZ;
+    // --- 1. dt ---
+    let dt = 0;
+    if (this.lastTimestamp !== null) {
+      const calc = (timestamp - this.lastTimestamp) / 1000;
+      if (calc > 0 && calc < MAX_DT_S) dt = calc;
+    }
+    this.lastTimestamp = timestamp;
+
+    // --- 2. LPF акселерометра ---
+    this.filteredAccelX = LPF_ALPHA * aX + (1 - LPF_ALPHA) * this.filteredAccelX;
+    this.filteredAccelY = LPF_ALPHA * aY + (1 - LPF_ALPHA) * this.filteredAccelY;
+    this.filteredAccelZ = LPF_ALPHA * aZ + (1 - LPF_ALPHA) * this.filteredAccelZ;
+
+    // --- 3. Калібрування осі руху (лише для детекції реверсу) ---
+    if (!this.isAxesCalibrated && obdFresh && speedRaw > 15 && speedRaw > this.previousSpeed) {
+      const ax = Math.abs(this.filteredAccelX);
+      const ay = Math.abs(this.filteredAccelY);
+      const az = Math.abs(this.filteredAccelZ);
+      if (ax >= ay && ax >= az) {
+        this.forwardAxis = 'x';
+        this.forwardSign = Math.sign(this.filteredAccelX) || 1;
+      } else if (ay >= az) {
+        this.forwardAxis = 'y';
+        this.forwardSign = Math.sign(this.filteredAccelY) || 1;
+      } else {
+        this.forwardAxis = 'z';
+        this.forwardSign = Math.sign(this.filteredAccelZ) || 1;
+      }
+      this.isAxesCalibrated = true;
     }
 
-    let cleanGyroZ = validGyroZ;
+    // --- 4. Кутова швидкість рискання: проєкція на вертикаль, рад/с -> град/с ---
+    const gNorm = Math.hypot(grX, grY, grZ);
+    const gravityValid = gNorm > MIN_GRAVITY_NORM;
+    let yawRateRaw = 0;
+    if (gravityValid) {
+      yawRateRaw =
+        ((gX * grX + gY * grY + gZ * grZ) / gNorm) * RAD2DEG * YAW_SIGN * GYRO_SCALE_FACTOR;
+    }
 
-    // 2. Машина станів та логіка ZUPT (медіанний фільтр)
-    if (rawSpeed === 0) {
+    // --- 5. Фільтр апаратних артефактів ---
+    let yawRateValid = yawRateRaw;
+    if (Math.abs(yawRateRaw) > GYRO_MAX_LIMIT_DEG) {
+      yawRateValid = this.lastValidYaw;
+    } else {
+      this.lastValidYaw = yawRateRaw;
+    }
+
+    // --- 6. Машина станів + ZUPT ---
+    let yawRateClean;
+    let zuptStd = null;
+    let zuptApplied = false;
+
+    if (isStopped) {
       this.currentState = 'STOPPED';
 
-      // Примусове скидання лінійних прискорень
-      rawAccelX = 0;
-      rawAccelY = 0;
+      aX = 0; aY = 0; aZ = 0;
       this.filteredAccelX = 0;
       this.filteredAccelY = 0;
+      this.filteredAccelZ = 0;
 
-      // Накопичення значень у кільцевий буфер
-      this.biasBuffer.push(validGyroZ);
-      if (this.biasBuffer.length > MAX_BIAS_BUFFER) {
-        this.biasBuffer.shift();
-      }
+      this.biasBuffer.push(yawRateValid);
+      if (this.biasBuffer.length > MAX_BIAS_BUFFER) this.biasBuffer.shift();
 
-      // Розрахунок медіани
-      if (this.biasBuffer.length > 0) {
-        const sorted = [...this.biasBuffer].sort((a, b) => a - b);
-        const mid = Math.floor(sorted.length / 2);
-        if (sorted.length % 2 !== 0) {
-          this.gyroZBias = sorted[mid];
-        } else {
-          this.gyroZBias = (sorted[mid - 1] + sorted[mid]) / 2;
+      if (this.biasBuffer.length >= ZUPT_MIN_SAMPLES) {
+        zuptStd = stdDev(this.biasBuffer);
+        if (zuptStd <= ZUPT_MAX_STD_DEG) {
+          this.gyroBias = median(this.biasBuffer);
+          zuptApplied = true;
         }
       }
 
-      // Для нерухомого стану кутова швидкість гарантовано нульова
-      cleanGyroZ = 0;
+      yawRateClean = 0; // авто на місці не повертає
     } else {
-      this.currentState = 'MOVING';
-
-      // Очищення буфера при початку/продовженні руху
-      if (this.biasBuffer.length > 0) {
-        this.biasBuffer = [];
-      }
-
-      // Компенсація дрейфу останнім зафіксованим медіанним gyroZBias
-      const currentBias = (typeof this.gyroZBias === 'number' && !isNaN(this.gyroZBias)) ? this.gyroZBias : 0;
-      cleanGyroZ = validGyroZ - currentBias;
+      this.currentState = obdFresh ? 'MOVING' : 'OBD_LOST';
+      if (this.biasBuffer.length) this.biasBuffer = [];
+      // Курс інтегруємо навіть при втраті OBD — поворот не можна пропускати
+      yawRateClean = yawRateValid - this.gyroBias;
     }
 
-    // 3. Low-Pass Filter для акселерометра
-    this.filteredAccelX = LPF_ALPHA * rawAccelX + (1 - LPF_ALPHA) * this.filteredAccelX;
-    this.filteredAccelY = LPF_ALPHA * rawAccelY + (1 - LPF_ALPHA) * this.filteredAccelY;
-    this.filteredAccelZ = LPF_ALPHA * rawAccelZ + (1 - LPF_ALPHA) * this.filteredAccelZ;
-
-    // 4. Розрахунок інтервалу часу dt
-    let dt = 0;
-    if (this.lastTimestamp !== null) {
-      const calculatedDt = (currentTimestamp - this.lastTimestamp) / 1000;
-      if (calculatedDt > 0 && calculatedDt < 1.0) {
-        dt = calculatedDt;
-      }
-    }
-
-    // 5. Розрахунок курсу (Heading Integration)
+    // --- 7. Інтеграція курсу ---
     if (dt > 0) {
-      const deltaHeading = (cleanGyroZ * GYRO_SCALE_FACTOR) * dt;
-      this.currentHeading = (this.currentHeading + deltaHeading) % 360;
-      if (this.currentHeading < 0) {
-        this.currentHeading += 360;
-      }
-    }
-    this.lastTimestamp = currentTimestamp;
-
-    // 6. Розрахунок відносної висоти
-    if (this.basePressure === null && rawPressure > 0) {
-      this.basePressure = rawPressure;
-    }
-    if (rawPressure > 0 && this.basePressure !== null) {
-      this.relativeAltitude = (this.basePressure - rawPressure) * 8.3;
+      this.currentHeading = (this.currentHeading + yawRateClean * dt) % 360;
+      if (this.currentHeading < 0) this.currentHeading += 360;
     }
 
-    // 7. Детекція реверсу
-    const isTransitionToMoving = this.previousSpeed === 0 && rawSpeed > 0;
-    if (isTransitionToMoving) {
-      this.isReversing = this.filteredAccelY < -0.1;
-    } else if (rawSpeed === 0) {
+    // --- 8. Відносна висота ---
+    if (this.basePressure === null && pressureRaw > 0) this.basePressure = pressureRaw;
+    if (pressureRaw > 0 && this.basePressure !== null) {
+      this.relativeAltitude = (this.basePressure - pressureRaw) * 8.3;
+    }
+
+    // --- 9. Детекція реверсу (на момент рушання) ---
+    if (isStopped) {
       this.isReversing = false;
+    } else if (obdFresh && this.previousSpeed === 0 && speedRaw > 0) {
+      const f =
+        this.forwardAxis === 'x' ? this.filteredAccelX
+          : this.forwardAxis === 'y' ? this.filteredAccelY
+            : this.filteredAccelZ;
+      this.isReversing = f * this.forwardSign < -0.1;
     }
-    this.previousSpeed = rawSpeed;
+    if (obdFresh) this.previousSpeed = speedRaw;
 
-    // 8. Навігаційне ядро (Dead Reckoning 2D)
-    let velocity_ms = rawSpeed / 3.6;
-    if (this.isReversing) {
-      velocity_ms *= -1;
-    }
-    const distance = velocity_ms * dt;
-    const headingRad = this.currentHeading * (Math.PI / 180);
-    this.posX += distance * Math.sin(headingRad);
-    this.posY += distance * Math.cos(headingRad);
+    // --- 10. Dead Reckoning 2D ---
+    let v = speedUsed / 3.6;
+    if (this.isReversing) v = -v;
+    const distance = v * dt;
+    const hRad = this.currentHeading * (Math.PI / 180);
+    this.posX += distance * Math.sin(hRad);
+    this.posY += distance * Math.cos(hRad);
 
     const entry = {
-      id: `${currentTimestamp}_${Math.random().toString(36).substring(2, 8)}`,
+      timestamp,
+      createdAt: new Date(timestamp).toISOString(),
+      sessionId: this.sessionId,
       currentState: this.currentState,
-      speed: rawSpeed,
-      gyroX: rawGyroX,
-      gyroY: rawGyroY,
-      gyroZ: cleanGyroZ,
-      cleanGyroZ: cleanGyroZ,
-      accelX: rawAccelX,
-      accelY: rawAccelY,
-      accelZ: rawAccelZ,
+      dt,
+      speedRaw,
+      speedUsed,
+      obdAgeMs: Number.isFinite(obdAgeMs) ? obdAgeMs : -1,
+      obdFresh,
+      gyroXRaw: gX,
+      gyroYRaw: gY,
+      gyroZRaw: gZ,
+      accelX: aX,
+      accelY: aY,
+      accelZ: aZ,
+      gravX: grX,
+      gravY: grY,
+      gravZ: grZ,
+      gravityValid,
+      yawRateRaw,
+      yawRateValid,
+      gyroBias: this.gyroBias,
+      yawRateClean,
+      zuptStd,
+      zuptApplied,
       filteredAccelX: this.filteredAccelX,
       filteredAccelY: this.filteredAccelY,
       filteredAccelZ: this.filteredAccelZ,
-      heading: this.currentHeading,
+      forwardAxis: this.forwardAxis,
+      forwardSign: this.forwardSign,
+      isAxesCalibrated: this.isAxesCalibrated,
       isReversing: this.isReversing,
-      altitude: this.relativeAltitude,
-      pressure: rawPressure,
+      heading: this.currentHeading,
       posX: this.posX,
       posY: this.posY,
-      lat: lat !== null && lat !== undefined && !isNaN(lat) ? Number(lat) : null,
-      lon: lon !== null && lon !== undefined && !isNaN(lon) ? Number(lon) : null,
-      timestamp: currentTimestamp,
-      createdAt: new Date(currentTimestamp).toISOString(),
+      pressure: pressureRaw,
+      altitude: this.relativeAltitude,
+      lat: lat !== null && lat !== undefined && Number.isFinite(Number(lat)) ? Number(lat) : null,
+      lon: lon !== null && lon !== undefined && Number.isFinite(Number(lon)) ? Number(lon) : null,
     };
 
-    this.memoryBuffer.push(entry);
-    await this._saveToStorage();
-
+    this.pendingPoints.push(entry);
+    this.unsyncedPoints += 1;
     return entry;
   }
 
+  // ------------------------------------------------------------------
+  // Локальне зберігання (файли-порції)
+  // ------------------------------------------------------------------
+
+  async _ensureDirs() {
+    for (const dir of [LOG_DIR, PENDING_DIR, SYNCED_DIR]) {
+      try {
+        const info = await FileSystem.getInfoAsync(dir);
+        if (!info.exists) await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+      } catch (e) {
+        console.error('[Telemetry] Не вдалося створити теку', dir, e);
+      }
+    }
+  }
+
+  // Ім'я файлу: <timestamp першої точки>_<sessionId>_<кількість>.json
+  _parseChunkName(name) {
+    const m = /^(\d+)_(.+)_(\d+)\.json$/.exec(name);
+    return m ? { startTs: Number(m[1]), sessionId: m[2], count: Number(m[3]) } : null;
+  }
+
+  async _listChunks(dir) {
+    try {
+      const names = await FileSystem.readDirectoryAsync(dir);
+      return names.filter((n) => n.endsWith('.json')).sort();
+    } catch (e) {
+      return [];
+    }
+  }
+
+  async _countPendingPoints() {
+    const names = await this._listChunks(PENDING_DIR);
+    return names.reduce((sum, n) => sum + (this._parseChunkName(n)?.count || 0), 0);
+  }
+
+  /** Скидає точки з пам'яті у файл-порцію */
+  async flush() {
+    if (this.isFlushing || this.pendingPoints.length === 0) return;
+    this.isFlushing = true;
+    const points = this.pendingPoints;
+    this.pendingPoints = [];
+    try {
+      const name = `${points[0].timestamp}_${this.sessionId || 'nosession'}_${points.length}.json`;
+      await FileSystem.writeAsStringAsync(
+        PENDING_DIR + name,
+        JSON.stringify({ sessionId: this.sessionId, points })
+      );
+    } catch (e) {
+      console.error('[Telemetry] Помилка запису порції:', e);
+      this.pendingPoints = points.concat(this.pendingPoints); // повертаємо назад
+    } finally {
+      this.isFlushing = false;
+      this._notifyBufferChange();
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Синхронізація з Firestore: одна порція = один документ
+  // ------------------------------------------------------------------
+
   startAutoSync() {
     if (this.syncTimer) return;
-    this.syncTimer = setInterval(() => {
-      this.syncNow();
-    }, SYNC_INTERVAL_MS);
+    this.syncTimer = setInterval(() => this.syncNow(), SYNC_INTERVAL_MS);
   }
 
   stopAutoSync() {
@@ -277,65 +446,118 @@ class TelemetryService {
     }
   }
 
-  /**
-   * Пакетна синхронізація з Firebase Firestore
-   */
   async syncNow() {
-    if (this.isSyncing) {
-      return { success: false, reason: 'already_syncing' };
-    }
-    if (!this.firestoreDb) {
-      console.error('[SYNC_ERROR] Firestore DB не ініціалізовано. Перевірте виклик telemetry.init(db)');
-      return { success: false, reason: 'firestore_not_initialized' };
-    }
-    if (this.memoryBuffer.length === 0) {
-      return { success: true, count: 0 };
-    }
+    if (this.isSyncing) return { success: false, reason: 'already_syncing' };
+    if (!this.firestoreDb) return { success: false, reason: 'firestore_not_initialized' };
 
-    let isConnected = false;
+    const names = (await this._listChunks(PENDING_DIR)).slice(0, MAX_CHUNKS_PER_SYNC);
+    if (names.length === 0) return { success: true, count: 0 };
+
     try {
-      const netState = await NetInfo.fetch();
-      isConnected = Boolean(netState.isConnected && netState.isInternetReachable !== false);
-    } catch (netErr) {
-      console.warn('[SYNC_ERROR] Помилка перевірки NetInfo:', netErr);
-      isConnected = false;
-    }
-
-    if (!isConnected) {
-      return { success: false, reason: 'offline', buffered: this.memoryBuffer.length };
+      const net = await NetInfo.fetch();
+      if (!(net.isConnected && net.isInternetReachable !== false)) {
+        return { success: false, reason: 'offline', buffered: this.unsyncedPoints };
+      }
+    } catch (e) {
+      return { success: false, reason: 'offline' };
     }
 
     this.isSyncing = true;
     try {
-      const chunk = this.memoryBuffer.slice(0, MAX_BATCH_SIZE);
       const batch = writeBatch(this.firestoreDb);
       const colRef = collection(this.firestoreDb, this.collectionName);
+      const included = [];
 
-      chunk.forEach((item) => {
-        const docRef = doc(colRef, item.id);
-        batch.set(docRef, item);
-      });
+      for (const name of names) {
+        try {
+          const raw = await FileSystem.readAsStringAsync(PENDING_DIR + name);
+          const data = JSON.parse(raw);
+          const pts = Array.isArray(data.points) ? data.points : [];
+          if (pts.length === 0) continue;
+          batch.set(doc(colRef, name.replace('.json', '')), {
+            sessionId: data.sessionId || null,
+            startTs: pts[0].timestamp,
+            endTs: pts[pts.length - 1].timestamp,
+            count: pts.length,
+            points: pts,
+          });
+          included.push({ name, count: pts.length });
+        } catch (e) {
+          console.warn('[Telemetry] Пошкоджена порція, пропускаю:', name, e);
+        }
+      }
+
+      if (included.length === 0) return { success: true, count: 0 };
 
       await batch.commit();
 
-      const sentIds = new Set(chunk.map((i) => i.id));
-      this.memoryBuffer = this.memoryBuffer.filter((i) => !sentIds.has(i.id));
-      await this._saveToStorage();
-
-      return { success: true, count: chunk.length, remaining: this.memoryBuffer.length };
+      let sent = 0;
+      for (const { name, count } of included) {
+        await FileSystem.moveAsync({ from: PENDING_DIR + name, to: SYNCED_DIR + name });
+        sent += count;
+      }
+      this.unsyncedPoints = Math.max(0, this.unsyncedPoints - sent);
+      return { success: true, count: sent, remaining: this.unsyncedPoints };
     } catch (error) {
-      console.error('[SYNC_ERROR] Помилка під час вивантаження batch у Firestore:', error);
-      return { success: false, error: error.message || error };
+      console.error('[SYNC_ERROR]', error);
+      return { success: false, reason: 'error', error: error?.message || String(error) };
     } finally {
       this.isSyncing = false;
+      this._notifyBufferChange();
     }
   }
 
-  getBufferSize() {
-    return this.memoryBuffer.length;
+  // ------------------------------------------------------------------
+  // Офлайн-експорт у CSV (з локальних файлів, без інтернету)
+  // ------------------------------------------------------------------
+
+  /**
+   * @param {string|null} sessionId — лише одна сесія; null = усі
+   * @returns {Promise<{success:boolean, uri?:string, rows?:number, error?:string}>}
+   */
+  async exportLocalCSV(sessionId = null) {
+    try {
+      await this.flush();
+      const files = [
+        ...(await this._listChunks(SYNCED_DIR)).map((n) => SYNCED_DIR + n),
+        ...(await this._listChunks(PENDING_DIR)).map((n) => PENDING_DIR + n),
+      ].sort((a, b) => a.split('/').pop().localeCompare(b.split('/').pop()));
+
+      const lines = [CSV_COLUMNS.join(',')];
+      for (const path of files) {
+        const meta = this._parseChunkName(path.split('/').pop());
+        if (sessionId && meta?.sessionId !== sessionId) continue;
+        try {
+          const data = JSON.parse(await FileSystem.readAsStringAsync(path));
+          for (const p of data.points || []) {
+            lines.push(
+              CSV_COLUMNS.map((c) => (p[c] === null || p[c] === undefined ? '' : p[c])).join(',')
+            );
+          }
+        } catch (e) {
+          console.warn('[Telemetry] Пропущено файл при експорті:', path);
+        }
+      }
+
+      if (lines.length === 1) return { success: false, error: 'Немає записаних даних' };
+
+      const uri = `${FileSystem.cacheDirectory}anti_reb_${sessionId || 'all'}_${Date.now()}.csv`;
+      await FileSystem.writeAsStringAsync(uri, lines.join('\n'));
+      return { success: true, uri, rows: lines.length - 1 };
+    } catch (e) {
+      return { success: false, error: e?.message || String(e) };
+    }
+  }
+
+  /** Видаляє вже синхронізовані порції (звільнення пам'яті телефону) */
+  async clearSynced() {
+    const names = await this._listChunks(SYNCED_DIR);
+    for (const n of names) {
+      await FileSystem.deleteAsync(SYNCED_DIR + n, { idempotent: true });
+    }
+    return names.length;
   }
 }
 
 export const telemetry = new TelemetryService();
 export default telemetry;
-

@@ -11,31 +11,35 @@ import {
   Alert,
 } from 'react-native';
 import * as Location from 'expo-location';
+import * as Sharing from 'expo-sharing';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
 import telemetry from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
 
+const OBD_STALE_MS = 2000;
+
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
+  const [obdStale, setObdStale] = useState(true);
   const [currentPressure, setCurrentPressure] = useState(0);
   const [location, setLocation] = useState(null);
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
 
   const [bufferCount, setBufferCount] = useState(0);
   const [lastSyncTime, setLastSyncTime] = useState(null);
-  const [syncError, setSyncError] = useState(false);
+  const [syncError, setSyncError] = useState(null);
   const [isExporting, setIsExporting] = useState(false);
 
   const [isRecording, setIsRecording] = useState(false);
   const [isBluetoothConnected, setIsBluetoothConnected] = useState(false);
   const [rawObd, setRawObd] = useState('Система готова до запуску');
+  const [nav, setNav] = useState(telemetry.getNavState());
 
-  // Сенсорний стек смартфона та ground-truth GPS
+  // Останні значення сенсорів (оновлюються без ре-рендерів)
   const latestData = useRef({
     speed: 0,
-    heading: 0,
     pressure: 0,
     lat: null,
     lon: null,
@@ -45,96 +49,107 @@ export default function App() {
     accelX: 0,
     accelY: 0,
     accelZ: 0,
+    gravX: 0,
+    gravY: 0,
+    gravZ: 0,
+    lastObdUpdateTime: 0, // 0 = OBD ще не відповідав -> дані вважаються несвіжими
   });
-
-  useEffect(() => {
-    latestData.current.speed = currentSpeed;
-  }, [currentSpeed]);
 
   useEffect(() => {
     latestData.current.pressure = currentPressure;
   }, [currentPressure]);
 
   useEffect(() => {
-    latestData.current.lat = location?.coords?.latitude || null;
-    latestData.current.lon = location?.coords?.longitude || null;
+    latestData.current.lat = location?.coords?.latitude ?? null;
+    latestData.current.lon = location?.coords?.longitude ?? null;
   }, [location]);
 
-  // Ініціалізація сервісу телеметрії
+  // Ініціалізація телеметрії (працює і без Firestore — лише локально)
   useEffect(() => {
     let isMounted = true;
-    const initApp = async () => {
+    (async () => {
       try {
-        if (db) {
-          await telemetry.init(db);
-          telemetry.setOnBufferChange((count) => {
-            if (isMounted) setBufferCount(count);
-          });
-          const count = telemetry.getBufferSize();
+        await telemetry.init(db || null);
+        telemetry.setOnBufferChange((count) => {
           if (isMounted) setBufferCount(count);
-        }
+        });
+        if (isMounted) setBufferCount(telemetry.getBufferSize());
       } catch (e) {
         console.error('Помилка ініціалізації:', e);
       }
-    };
-    initApp();
+    })();
     return () => {
       isMounted = false;
     };
   }, []);
 
-  // Крок 2: Розподіл частот (Decoupling) — запис телеметрії на жорстких 20 Гц (50 мс)
+  // Цикл ядра 20 Гц. recordPoint синхронний — тики не накладаються.
+  // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
   useEffect(() => {
-    let interval;
-    if (isRecording) {
-      interval = setInterval(async () => {
-        try {
-          // Зріз найсвіжіших даних сенсорів із таймстемпом поточної ітерації
-          const payload = {
-            ...latestData.current,
-            timestamp: Date.now(),
-          };
-          await telemetry.recordPoint(payload);
-          setBufferCount(telemetry.getBufferSize());
-        } catch (err) {
-          console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
-        }
-      }, 50); // Жорсткі 20 Гц
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
+    if (!isRecording) return undefined;
+    const interval = setInterval(() => {
+      try {
+        const now = Date.now();
+        const d = latestData.current;
+        telemetry.recordPoint({
+          speed: d.speed,
+          obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
+          gyroX: d.gyroX,
+          gyroY: d.gyroY,
+          gyroZ: d.gyroZ,
+          accelX: d.accelX,
+          accelY: d.accelY,
+          accelZ: d.accelZ,
+          gravX: d.gravX,
+          gravY: d.gravY,
+          gravZ: d.gravZ,
+          pressure: d.pressure,
+          lat: d.lat,
+          lon: d.lon,
+          timestamp: now,
+        });
+      } catch (err) {
+        console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
+      }
+    }, 50);
+    return () => clearInterval(interval);
   }, [isRecording]);
+
+  // Оновлення UI 2 Гц (курс, позиція, буфер, стан OBD)
+  useEffect(() => {
+    const ui = setInterval(() => {
+      setNav(telemetry.getNavState());
+      setBufferCount(telemetry.getBufferSize());
+      const last = latestData.current.lastObdUpdateTime;
+      setObdStale(!last || Date.now() - last > OBD_STALE_MS);
+    }, 500);
+    return () => clearInterval(ui);
+  }, []);
 
   // Барометр (1 Гц)
   useEffect(() => {
-    Barometer.setUpdateInterval(1000);
-    let baroSubscription;
-    const startBarometer = async () => {
+    let sub;
+    (async () => {
       try {
         if (await Barometer.isAvailableAsync()) {
-          baroSubscription = Barometer.addListener((data) => {
-            setCurrentPressure(data.pressure);
-          });
+          Barometer.setUpdateInterval(1000);
+          sub = Barometer.addListener((data) => setCurrentPressure(data.pressure));
         }
       } catch (e) {
         console.warn('Барометр недоступний:', e);
       }
-    };
-    startBarometer();
-    return () => {
-      if (baroSubscription) baroSubscription.remove();
-    };
+    })();
+    return () => sub && sub.remove();
   }, []);
 
-  // Гіроскоп (20 Гц / 50 мс)
+  // Гіроскоп (20 Гц). Одиниці: рад/с — конвертація в ядрі.
   useEffect(() => {
-    let gyroSubscription;
-    const startGyroscope = async () => {
+    let sub;
+    (async () => {
       try {
         if (await Gyroscope.isAvailableAsync()) {
           Gyroscope.setUpdateInterval(50);
-          gyroSubscription = Gyroscope.addListener((data) => {
+          sub = Gyroscope.addListener((data) => {
             latestData.current.gyroX = data.x;
             latestData.current.gyroY = data.y;
             latestData.current.gyroZ = data.z;
@@ -143,47 +158,48 @@ export default function App() {
       } catch (e) {
         console.warn('Гіроскоп недоступний:', e);
       }
-    };
-    startGyroscope();
-    return () => {
-      if (gyroSubscription) gyroSubscription.remove();
-    };
+    })();
+    return () => sub && sub.remove();
   }, []);
 
-  // Крок 1: Заміна Accelerometer на DeviceMotion (Лінійне прискорення без гравітації Землі 1G)
+  // DeviceMotion: лінійне прискорення + вектор гравітації (20 Гц)
   useEffect(() => {
-    let motionSubscription;
-    const startDeviceMotion = async () => {
+    let sub;
+    (async () => {
       try {
         if (await DeviceMotion.isAvailableAsync()) {
-          DeviceMotion.setUpdateInterval(50); // 50 мс = 20 Гц
-          motionSubscription = DeviceMotion.addListener((data) => {
-            if (data?.acceleration) {
-              latestData.current.accelX = data.acceleration.x || 0;
-              latestData.current.accelY = data.acceleration.y || 0;
-              latestData.current.accelZ = data.acceleration.z || 0;
+          DeviceMotion.setUpdateInterval(50);
+          sub = DeviceMotion.addListener((data) => {
+            const a = data?.acceleration;
+            const ag = data?.accelerationIncludingGravity;
+            if (a) {
+              latestData.current.accelX = a.x || 0;
+              latestData.current.accelY = a.y || 0;
+              latestData.current.accelZ = a.z || 0;
+            }
+            if (a && ag) {
+              latestData.current.gravX = ag.x - a.x;
+              latestData.current.gravY = ag.y - a.y;
+              latestData.current.gravZ = ag.z - a.z;
             }
           });
         }
       } catch (e) {
         console.warn('DeviceMotion недоступний:', e);
       }
-    };
-    startDeviceMotion();
-    return () => {
-      if (motionSubscription) motionSubscription.remove();
-    };
+    })();
+    return () => sub && sub.remove();
   }, []);
 
-  // Еталонний GPS (Ground Truth)
+  // Еталонний GPS (Ground Truth, у розрахунках не бере участі)
   useEffect(() => {
-    let locSubscription;
+    let sub;
     (async () => {
       try {
         if (isGpsEnabled) {
-          let { status } = await Location.requestForegroundPermissionsAsync();
+          const { status } = await Location.requestForegroundPermissionsAsync();
           if (status === 'granted') {
-            locSubscription = await Location.watchPositionAsync(
+            sub = await Location.watchPositionAsync(
               { accuracy: Location.Accuracy.High, timeInterval: 1000 },
               (loc) => setLocation(loc)
             );
@@ -198,12 +214,9 @@ export default function App() {
         setIsGpsEnabled(false);
       }
     })();
-    return () => {
-      if (locSubscription) locSubscription.remove();
-    };
+    return () => sub && sub.remove();
   }, [isGpsEnabled]);
 
-  // Підключення OBD — лише асинхронне оновлення швидкості (без виклику телеметрії)
   const connectBluetooth = async () => {
     try {
       if (Platform.OS === 'android') {
@@ -219,19 +232,23 @@ export default function App() {
       }
 
       setRawObd('Підключення через Native Module...');
-
       const connected = await obdScanner.connectToELM();
 
       if (connected) {
         setIsBluetoothConnected(true);
-
         obdScanner.startReadingSpeed(
-          (speed) => {
-            const parsedSpeed = typeof speed === 'number' && !isNaN(speed) ? speed : 0;
-            setCurrentSpeed(parsedSpeed);
-            latestData.current.speed = parsedSpeed; // Лише актуалізація зліпку швидкості
+          (speed, hwTimestamp) => {
+            const parsed = typeof speed === 'number' && !isNaN(speed) ? speed : 0;
+            latestData.current.speed = parsed;
+            // Kotlin System.currentTimeMillis() і JS Date.now() — один годинник
+            latestData.current.lastObdUpdateTime =
+              typeof hwTimestamp === 'number' ? hwTimestamp : Date.now();
+            setCurrentSpeed(parsed);
           },
-          (status) => setRawObd(status)
+          (status) => {
+            setRawObd(status);
+            if (status === "Розрив зв'язку") setIsBluetoothConnected(false);
+          }
         );
       } else {
         setIsBluetoothConnected(false);
@@ -243,28 +260,71 @@ export default function App() {
     }
   };
 
-  const handleSync = async () => {
-    try {
-      setSyncError(false);
-      await telemetry.syncNow();
-      setBufferCount(telemetry.getBufferSize());
-      const now = new Date();
-      setLastSyncTime(
-        `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
-      );
-    } catch (e) {
-      setSyncError(true);
+  const toggleRecording = async () => {
+    if (!isRecording) {
+      telemetry.startSession();
+      setNav(telemetry.getNavState());
+      setIsRecording(true);
+    } else {
+      setIsRecording(false);
+      await telemetry.stopSession();
     }
   };
 
-  const handleExport = async () => {
-    setIsExporting(true);
-    const result = await exportFirestoreToCSV(db);
-    setIsExporting(false);
-    if (!result.success) {
-      Alert.alert('Помилка експорту', result.error);
+  const handleSync = async () => {
+    const result = await telemetry.syncNow();
+    setBufferCount(telemetry.getBufferSize());
+    if (result.success) {
+      setSyncError(null);
+      const now = new Date();
+      setLastSyncTime(
+        [now.getHours(), now.getMinutes(), now.getSeconds()]
+          .map((v) => v.toString().padStart(2, '0'))
+          .join(':')
+      );
+    } else {
+      const reasons = {
+        offline: 'НЕМАЄ МЕРЕЖІ',
+        firestore_not_initialized: 'FIREBASE ВИМК.',
+        already_syncing: 'ЗАЧЕКАЙТЕ...',
+      };
+      setSyncError(reasons[result.reason] || 'ПОМИЛКА');
     }
   };
+
+  // Офлайн-експорт з локальних файлів (інтернет не потрібен)
+  const handleExport = async () => {
+    setIsExporting(true);
+    try {
+      const result = await telemetry.exportLocalCSV();
+      if (!result.success) {
+        Alert.alert('Помилка експорту', result.error);
+        return;
+      }
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(result.uri, { mimeType: 'text/csv', dialogTitle: 'Лог Anti-Reb' });
+      } else {
+        Alert.alert('Експорт', `Файл збережено:\n${result.uri}`);
+      }
+    } catch (e) {
+      Alert.alert('Помилка експорту', e.message);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // Довге натискання на ЕКСПОРТ — вивантаження з Firebase (потрібен інтернет)
+  const handleCloudExport = async () => {
+    setIsExporting(true);
+    try {
+      const result = await exportFirestoreToCSV(db);
+      if (!result.success) Alert.alert('Помилка експорту з хмари', result.error);
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  const stateColor = { STOPPED: '#facc15', MOVING: '#4ade80', OBD_LOST: '#f87171' };
 
   return (
     <View style={styles.container}>
@@ -286,8 +346,10 @@ export default function App() {
       <View style={styles.grid}>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD)</Text>
-          <Text style={styles.cardValue}>{currentSpeed}</Text>
-          <Text style={styles.cardSub}>{isBluetoothConnected ? 'Онлайн' : 'Офлайн'}</Text>
+          <Text style={[styles.cardValue, obdStale && { color: '#64748b' }]}>{currentSpeed}</Text>
+          <Text style={styles.cardSub}>
+            {!isBluetoothConnected ? 'Офлайн' : obdStale ? 'Дані застаріли' : 'Онлайн'}
+          </Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>RAW (ДЕБАГ)</Text>
@@ -296,11 +358,29 @@ export default function App() {
           </Text>
         </View>
         <View style={styles.card}>
+          <Text style={styles.cardLabel}>КУРС / СТАН</Text>
+          <Text style={styles.cardValue}>
+            {nav.heading.toFixed(0)}
+            <Text style={{ fontSize: 16 }}>°</Text>
+          </Text>
+          <Text style={[styles.cardSub, { color: stateColor[nav.state] || '#64748b' }]}>
+            {nav.state} · bias {nav.gyroBias.toFixed(2)}°/с
+          </Text>
+        </View>
+        <View style={styles.card}>
+          <Text style={styles.cardLabel}>ПОЗИЦІЯ DR (м)</Text>
+          <Text style={styles.cardValueSmall}>
+            X: {nav.posX.toFixed(1)}
+            {'\n'}Y: {nav.posY.toFixed(1)}
+          </Text>
+          <Text style={styles.cardSub}>{nav.isReversing ? 'РЕВЕРС' : 'Вперед'}</Text>
+        </View>
+        <View style={styles.card}>
           <Text style={styles.cardLabel}>ТИСК (BARO)</Text>
           <Text style={styles.cardValue}>
             {currentPressure ? currentPressure.toFixed(1) : 0} <Text style={{ fontSize: 16 }}>hPa</Text>
           </Text>
-          <Text style={styles.cardSub}>Висотомір</Text>
+          <Text style={styles.cardSub}>Відн. висота {nav.altitude.toFixed(1)} м</Text>
         </View>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>GROUND TRUTH GPS</Text>
@@ -324,22 +404,25 @@ export default function App() {
 
       <View style={styles.bufferInfo}>
         <Text style={styles.bufferText}>
-          Буфер: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}
+          Не синхр.: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}
         </Text>
       </View>
 
       <View style={styles.controlsRow}>
         <TouchableOpacity style={styles.syncBtn} onPress={handleSync}>
-          <Text style={styles.syncBtnText}>{syncError ? 'ПОМИЛКА' : 'СИНХРОНІЗУВАТИ'}</Text>
+          <Text style={styles.syncBtnText}>{syncError || 'СИНХРОНІЗУВАТИ'}</Text>
         </TouchableOpacity>
-        <TouchableOpacity style={styles.syncBtn} onPress={handleExport} disabled={isExporting}>
+        <TouchableOpacity style={styles.syncBtn} onPress={handleExport}
+          onLongPress={handleCloudExport}
+          disabled={isExporting}
+        >
           <Text style={styles.syncBtnText}>{isExporting ? 'ФОРМУВАННЯ...' : 'ЕКСПОРТ (CSV)'}</Text>
         </TouchableOpacity>
       </View>
 
       <TouchableOpacity
         style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]}
-        onPress={() => setIsRecording(!isRecording)}
+        onPress={toggleRecording}
       >
         <Text style={styles.recordBtnText}>{isRecording ? 'ЗУПИНИТИ ЗАПИС' : 'ЗАПИС ЛОГУ'}</Text>
       </TouchableOpacity>
@@ -402,9 +485,9 @@ const styles = StyleSheet.create({
   card: {
     backgroundColor: '#151c2c',
     width: '48%',
-    padding: 15,
+    padding: 12,
     borderRadius: 10,
-    marginBottom: 15,
+    marginBottom: 10,
     borderWidth: 1,
     borderColor: '#222f47',
   },

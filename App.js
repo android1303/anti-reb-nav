@@ -15,11 +15,18 @@ import * as Sharing from 'expo-sharing';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
-import telemetry from './telemetry';
+import telemetry, { CORE_VERSION } from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
 
 const OBD_STALE_MS = 2000;
+const SYNC_ERROR_DISPLAY_MS = 4000;
+
+const formatHHMMSS = (ms) => {
+  if (!ms) return null;
+  const d = new Date(ms);
+  return [d.getHours(), d.getMinutes(), d.getSeconds()].map((v) => String(v).padStart(2, '0')).join(':');
+};
 
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
@@ -29,8 +36,9 @@ export default function App() {
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
 
   const [bufferCount, setBufferCount] = useState(0);
-  const [lastSyncTime, setLastSyncTime] = useState(null);
+  const [syncState, setSyncState] = useState(telemetry.getSyncState());
   const [syncError, setSyncError] = useState(null);
+  const syncErrorTimer = useRef(null);
   const [isExporting, setIsExporting] = useState(false);
 
   const [isRecording, setIsRecording] = useState(false);
@@ -44,6 +52,7 @@ export default function App() {
     pressure: 0,
     lat: null,
     lon: null,
+    gpsAccuracy: null,
     gyroX: 0,
     gyroY: 0,
     gyroZ: 0,
@@ -63,6 +72,7 @@ export default function App() {
   useEffect(() => {
     latestData.current.lat = location?.coords?.latitude ?? null;
     latestData.current.lon = location?.coords?.longitude ?? null;
+    latestData.current.gpsAccuracy = location?.coords?.accuracy ?? null;
   }, [location]);
 
   // Ініціалізація телеметрії (працює і без Firestore — лише локально)
@@ -107,6 +117,7 @@ export default function App() {
           pressure: d.pressure,
           lat: d.lat,
           lon: d.lon,
+          gpsAccuracy: d.gpsAccuracy,
           timestamp: now,
         });
       } catch (err) {
@@ -122,15 +133,23 @@ export default function App() {
     else deactivateKeepAwake('recording').catch(() => {});
   }, [isRecording]);
 
-  // Оновлення UI 2 Гц (курс, позиція, буфер, стан OBD)
+  // Оновлення UI 2 Гц (курс, позиція, буфер, стан OBD, стан синхронізації)
   useEffect(() => {
     const ui = setInterval(() => {
       setNav(telemetry.getNavState());
       setBufferCount(telemetry.getBufferSize());
+      setSyncState(telemetry.getSyncState());
       const last = latestData.current.lastObdUpdateTime;
       setObdStale(!last || Date.now() - last > OBD_STALE_MS);
     }, 500);
     return () => clearInterval(ui);
+  }, []);
+
+  // Очищення таймера банера помилки синхронізації при розмонтуванні
+  useEffect(() => {
+    return () => {
+      if (syncErrorTimer.current) clearTimeout(syncErrorTimer.current);
+    };
   }, []);
 
   // Барометр (1 Гц)
@@ -207,7 +226,7 @@ export default function App() {
           const { status } = await Location.requestForegroundPermissionsAsync();
           if (status === 'granted') {
             sub = await Location.watchPositionAsync(
-              { accuracy: Location.Accuracy.High, timeInterval: 1000 },
+              { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 0 },
               (loc) => setLocation(loc)
             );
           } else {
@@ -284,31 +303,26 @@ export default function App() {
 
   const handleSync = async () => {
     const result = await telemetry.syncNow();
+    setSyncState(telemetry.getSyncState());
     setBufferCount(telemetry.getBufferSize());
-    if (result.success) {
-      setSyncError(null);
-      const now = new Date();
-      setLastSyncTime(
-        [now.getHours(), now.getMinutes(), now.getSeconds()]
-          .map((v) => v.toString().padStart(2, '0'))
-          .join(':')
-      );
-    } else {
-      const reasons = {
-        offline: 'НЕМАЄ МЕРЕЖІ',
-        firestore_not_initialized: 'FIREBASE ВИМК.',
-        already_syncing: 'ЗАЧЕКАЙТЕ...',
-        recording: 'ЗУПИНІТЬ ЗАПИС',
-      };
-      setSyncError(reasons[result.reason] || 'ПОМИЛКА');
-    }
+    if (result.success) return;
+    // already_syncing / recording — кнопка вже відображає цей стан, банер помилки не потрібен
+    if (result.reason === 'already_syncing' || result.reason === 'recording') return;
+
+    const reasons = {
+      offline: 'НЕМАЄ МЕРЕЖІ',
+      firestore_not_initialized: 'FIREBASE ВИМК.',
+    };
+    setSyncError(reasons[result.reason] || 'ПОМИЛКА');
+    if (syncErrorTimer.current) clearTimeout(syncErrorTimer.current);
+    syncErrorTimer.current = setTimeout(() => setSyncError(null), SYNC_ERROR_DISPLAY_MS);
   };
 
   // Офлайн-експорт з локальних файлів (інтернет не потрібен)
-  const handleExport = async () => {
+  const doExport = async (sessionId) => {
     setIsExporting(true);
     try {
-      const result = await telemetry.exportLocalCSV();
+      const result = await telemetry.exportLocalCSV(sessionId);
       if (!result.success) {
         Alert.alert('Помилка експорту', result.error);
         return;
@@ -323,6 +337,15 @@ export default function App() {
     } finally {
       setIsExporting(false);
     }
+  };
+
+  const handleExport = async () => {
+    const lastSessionId = await telemetry.getLastSessionId();
+    Alert.alert('Експорт CSV', 'Яку сесію експортувати?', [
+      { text: 'Остання сесія', onPress: () => doExport(lastSessionId) },
+      { text: 'Усі сесії', onPress: () => doExport(null) },
+      { text: 'Скасувати', style: 'cancel' },
+    ]);
   };
 
   // Довге натискання на ЕКСПОРТ — вивантаження з Firebase (потрібен інтернет)
@@ -420,13 +443,23 @@ export default function App() {
 
       <View style={styles.bufferInfo}>
         <Text style={styles.bufferText}>
-          Не синхр.: {bufferCount} | Синхр: {lastSyncTime || '--:--:--'}
+          Не синхр.: {bufferCount} | Синхр: {formatHHMMSS(syncState.lastSyncAt) || '--:--:--'}
         </Text>
       </View>
 
       <View style={styles.controlsRow}>
-        <TouchableOpacity style={styles.syncBtn} onPress={handleSync}>
-          <Text style={styles.syncBtnText}>{syncError || 'СИНХРОНІЗУВАТИ'}</Text>
+        <TouchableOpacity
+          style={styles.syncBtn}
+          onPress={handleSync}
+          disabled={syncState.isRecording || syncState.isSyncing}
+        >
+          <Text style={styles.syncBtnText}>
+            {syncState.isRecording
+              ? 'ПІСЛЯ ЗАПИСУ'
+              : syncState.isSyncing
+              ? 'СИНХРОНІЗАЦІЯ...'
+              : syncError || 'СИНХРОНІЗУВАТИ'}
+          </Text>
         </TouchableOpacity>
         <TouchableOpacity style={styles.syncBtn} onPress={handleExport}
           onLongPress={handleCloudExport}
@@ -444,7 +477,7 @@ export default function App() {
       </TouchableOpacity>
 
       <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 15, marginBottom: 10 }}>
-        Білд: {obdScanner.getVersion()}
+        Білд: {obdScanner.getVersion()} · ядро {CORE_VERSION}
       </Text>
     </View>
   );

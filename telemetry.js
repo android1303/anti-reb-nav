@@ -113,7 +113,7 @@ export const CSV_COLUMNS = [
   'yawRateRaw', 'yawRateValid', 'gyroBias', 'yawRateClean', 'zuptStd', 'zuptApplied',
   'filteredAccelX', 'filteredAccelY', 'filteredAccelZ',
   'forwardAxis', 'forwardSign', 'isAxesCalibrated', 'isReversing',
-  'heading', 'posX', 'posY', 'pressure', 'altitude', 'lat', 'lon',
+  'heading', 'posX', 'posY', 'pressure', 'altitude', 'lat', 'lon', 'gpsAccuracy',
 ];
 
 const num = (v) => {
@@ -155,6 +155,8 @@ class TelemetryService {
     this.isSyncing = false;
     this.isRecording = false;
     this.sessionId = null;
+    this.lastSyncAt = null; // мс (Date.now()), null = ще не синхронізували
+    this.lastSyncResult = null; // останній результат syncNow() (успіх або помилка)
 
     this.resetNavigation();
   }
@@ -224,6 +226,15 @@ class TelemetryService {
     return this.unsyncedPoints;
   }
 
+  getSyncState() {
+    return {
+      isSyncing: this.isSyncing,
+      isRecording: this.isRecording,
+      lastSyncAt: this.lastSyncAt,
+      lastSyncResult: this.lastSyncResult,
+    };
+  }
+
   getNavState() {
     return {
       state: this.currentState,
@@ -275,6 +286,7 @@ class TelemetryService {
     pressure = 0,
     lat = null,
     lon = null,
+    gpsAccuracy = null,
     timestamp,
   }) {
     if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
@@ -498,6 +510,10 @@ class TelemetryService {
       altitude: this.relativeAltitude,
       lat: lat !== null && lat !== undefined && Number.isFinite(Number(lat)) ? Number(lat) : null,
       lon: lon !== null && lon !== undefined && Number.isFinite(Number(lon)) ? Number(lon) : null,
+      gpsAccuracy:
+        gpsAccuracy !== null && gpsAccuracy !== undefined && Number.isFinite(Number(gpsAccuracy))
+          ? Number(gpsAccuracy)
+          : null,
     };
 
     this.pendingPoints.push(entry);
@@ -578,6 +594,13 @@ class TelemetryService {
   }
 
   async syncNow() {
+    const result = await this._syncNowImpl();
+    this.lastSyncResult = result;
+    if (result.success) this.lastSyncAt = Date.now();
+    return result;
+  }
+
+  async _syncNowImpl() {
     // Під час запису синхронізація блокувала потік JS (у тесті — до 2.6 с)
     if (this.isRecording) return { success: false, reason: 'recording' };
     if (this.isSyncing) return { success: false, reason: 'already_syncing' };
@@ -640,6 +663,22 @@ class TelemetryService {
     }
   }
 
+  /** sessionId останньої сесії: поточна/щойно зупинена, інакше — з порції з найбільшим startTs */
+  async getLastSessionId() {
+    if (this.sessionId) return this.sessionId;
+    const names = [...(await this._listChunks(PENDING_DIR)), ...(await this._listChunks(SYNCED_DIR))];
+    let best = null;
+    let bestTs = -Infinity;
+    for (const name of names) {
+      const meta = this._parseChunkName(name);
+      if (meta && meta.startTs > bestTs) {
+        bestTs = meta.startTs;
+        best = meta.sessionId;
+      }
+    }
+    return best;
+  }
+
   // ------------------------------------------------------------------
   // Офлайн-експорт у CSV (з локальних файлів, без інтернету)
   // ------------------------------------------------------------------
@@ -672,7 +711,7 @@ class TelemetryService {
 
       if (lines.length === 1) return { success: false, error: 'Немає записаних даних' };
 
-      const uri = `${FileSystem.cacheDirectory}anti_reb_${sessionId || 'all'}_${Date.now()}.csv`;
+      const uri = `${FileSystem.cacheDirectory}anti_reb_${sessionId || 'all'}_${Date.now()}_${CORE_VERSION}.csv`;
       await FileSystem.writeAsStringAsync(uri, lines.join('\n'));
       return { success: true, uri, rows: lines.length - 1 };
     } catch (e) {

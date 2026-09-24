@@ -2,11 +2,13 @@
 /**
  * Відтворення заїзду: подає сирі колонки CSV у справжнє ядро telemetry.js.
  *
- *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра]
+ *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId]
  *
  * За замовчуванням ядро = ./telemetry.js, вихід = replay_out.csv.
  * Щоб перевірити інші константи — скопіюй telemetry.js у тимчасовий файл,
  * зміни константу і передай його третім аргументом.
+ * sessionId (4-й аргумент, опційно): відтворити лише рядки з цим sessionId
+ * (для кумулятивних дампів з кількома сесіями).
  * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
@@ -16,9 +18,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js'] = process.argv;
+const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js', sessionId] = process.argv;
 if (!csvPath) {
-  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js]');
+  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId]');
   process.exit(1);
 }
 
@@ -63,6 +65,10 @@ if (missing.length) {
   console.error('У CSV бракує сирих колонок:', missing.join(', '));
   process.exit(1);
 }
+if (sessionId && !('sessionId' in col)) {
+  console.error('Заданий sessionId, але в CSV немає колонки sessionId.');
+  process.exit(1);
+}
 const num = (cells, k) => {
   if (!(k in col)) return 0;
   const v = cells[col[k]]?.replace(/^"|"$/g, '');
@@ -71,10 +77,12 @@ const num = (cells, k) => {
 
 telemetry.startSession();
 const outCols = ['timestamp', 'currentState', 'speedUsed', 'speedExtrapolated', 'gapS', 'yawRateClean',
-  'gyroBias', 'zuptApplied', 'heading', 'posX', 'posY', 'lat', 'lon'];
+  'gyroBias', 'zuptApplied', 'heading', 'posX', 'posY', 'lat', 'lon',
+  'forwardAxis', 'forwardSign', 'isReversing'];
 const out = [outCols.join(',')];
 for (const line of lines.slice(1)) {
   const c = line.split(',');
+  if (sessionId && c[col.sessionId] !== sessionId) continue;
   const lat = num(c, 'lat'), lon = num(c, 'lon');
   const e = telemetry.recordPoint({
     speed: num(c, 'speedRaw'), obdAgeMs: num(c, 'obdAgeMs'),

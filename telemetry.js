@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v16)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v17)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -45,8 +45,25 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  *     швидкістю (у тесті пауза 2.6 с «з'їла» 16 м). Колонка gapS.
  * 13. Синхронізація з Firestore блокувала потік JS (паузи кожні 30 с,
  *     до 2.6 с) — під час запису вимкнена, запускається після stopSession.
+ *
+ * Зміни v17 (за польовим тестом №2, 24.09.2026):
+ * 14. Вісь руху: обирається лише серед двох осей, що НЕ найближчі до
+ *     вертикалі (вісь, найближча до вектора гравітації, віссю руху бути
+ *     не може). Раніше калібрування могло вибрати вертикальну вісь —
+ *     на прямій тесту №2 це разом із п.15 давало хибний реверс.
+ * 15. Детекція реверсу: рішення приймається за середнім прискоренням
+ *     вздовж осі руху за перші 20 тиків (1 с) після рушання, а не за
+ *     одним тіком одразу після скидання LPF на стоянці. Працює лише
+ *     після калібрування осі (isAxesCalibrated) і знімається понад
+ *     REVERSE_MAX_KMH — на такій швидкості реверс неможливий.
+ * 16. Bias ZUPT оцінюється і пишеться в лог (gyroBias, zuptStd,
+ *     zuptApplied), але більше НЕ віднімається від курсу
+ *     (ZUPT_APPLY_TO_HEADING = false): у тестах №1 і №2 bias на стоянці
+ *     мав протилежний знак до оптимального bias у русі — застосування
+ *     погіршувало похибку (тест №2, пряма: 144.6 → 586.4 м).
  * ===================================================================== */
 
+export const CORE_VERSION = 'v17';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -72,6 +89,14 @@ const ZUPT_SETTLE_SAMPLES = 20; // перша 1 с зупинки не йде в
 const ZUPT_MIN_SAMPLES = 200; // оцінка bias лише після 10 с стоянки
 const ZUPT_MAX_STD_DEG = 2.5; // град/с; у тесті на зупинках 0.56–2.2 (вібрація двигуна)
 const BIAS_WEIGHT_CAP = 2400; // макс. «пам'ять» bias у зразках (~2 хв стоянок)
+// Bias зі стоянок оцінюється і пишеться в лог, але НЕ віднімається від курсу:
+// у тестах №1 і №2 bias на стоянці мав протилежний знак до bias у русі.
+const ZUPT_APPLY_TO_HEADING = false;
+
+// --- Реверс ---
+const REVERSE_WINDOW_SAMPLES = 20; // 1 с після рушання
+const REVERSE_ACCEL_MIN = 0.2; // м/с², середнє вздовж осі руху
+const REVERSE_MAX_KMH = 20; // вище — реверс неможливий, знімаємо прапорець
 
 // --- OBD / час ---
 const OBD_STALE_MS = 2000; // дані швидкості старші за це вважаються втраченими
@@ -164,6 +189,9 @@ class TelemetryService {
 
     // Реверс / висота
     this.isReversing = false;
+    this.revSum = 0;
+    this.revN = 0;
+    this.revPending = false;
     this.basePressure = null;
     this.relativeAltitude = 0;
 
@@ -282,19 +310,14 @@ class TelemetryService {
 
     // --- 3. Калібрування осі руху (лише для детекції реверсу) ---
     if (!this.isAxesCalibrated && obdFresh && speedRaw > 15 && speedRaw > this.previousSpeed) {
-      const ax = Math.abs(this.filteredAccelX);
-      const ay = Math.abs(this.filteredAccelY);
-      const az = Math.abs(this.filteredAccelZ);
-      if (ax >= ay && ax >= az) {
-        this.forwardAxis = 'x';
-        this.forwardSign = Math.sign(this.filteredAccelX) || 1;
-      } else if (ay >= az) {
-        this.forwardAxis = 'y';
-        this.forwardSign = Math.sign(this.filteredAccelY) || 1;
-      } else {
-        this.forwardAxis = 'z';
-        this.forwardSign = Math.sign(this.filteredAccelZ) || 1;
-      }
+      // вісь, найближча до вертикалі, не може бути віссю руху
+      const gA = [Math.abs(grX), Math.abs(grY), Math.abs(grZ)];
+      const vert = gA.indexOf(Math.max(...gA));
+      const cand = [['x', this.filteredAccelX], ['y', this.filteredAccelY], ['z', this.filteredAccelZ]]
+        .filter((_, i) => i !== vert);
+      const best = Math.abs(cand[0][1]) >= Math.abs(cand[1][1]) ? cand[0] : cand[1];
+      this.forwardAxis = best[0];
+      this.forwardSign = Math.sign(best[1]) || 1;
       this.isAxesCalibrated = true;
     }
 
@@ -370,7 +393,7 @@ class TelemetryService {
         this.biasBuffer = [];
       }
       // Курс інтегруємо навіть при втраті OBD — поворот не можна пропускати
-      yawRateClean = yawRateValid - this.gyroBias;
+      yawRateClean = yawRateValid - (ZUPT_APPLY_TO_HEADING ? this.gyroBias : 0);
     }
 
     // --- 7. Інтеграція курсу ---
@@ -398,15 +421,30 @@ class TelemetryService {
       speedExtrapolated = true;
     }
 
-    // --- 9. Детекція реверсу (на момент рушання) ---
+    // --- 9. Детекція реверсу: середнє прискорення вздовж осі руху за перші
+    // REVERSE_WINDOW_SAMPLES тиків після рушання (одиночний тік вирішувався шумом).
+    // Лише після калібрування осі; знімається на швидкості > REVERSE_MAX_KMH.
     if (isStopped) {
       this.isReversing = false;
-    } else if (obdFresh && this.previousSpeed === 0 && speedRaw > 0) {
-      const f =
-        this.forwardAxis === 'x' ? this.filteredAccelX
-          : this.forwardAxis === 'y' ? this.filteredAccelY
-            : this.filteredAccelZ;
-      this.isReversing = f * this.forwardSign < -0.1;
+      this.revSum = 0;
+      this.revN = 0;
+      this.revPending = false;
+    } else if (obdFresh) {
+      if (this.previousSpeed === 0 && speedRaw > 0) {
+        this.revSum = 0;
+        this.revN = 0;
+        this.revPending = this.isAxesCalibrated;
+      }
+      if (this.revPending) {
+        const a = this.forwardAxis === 'x' ? aX : this.forwardAxis === 'y' ? aY : aZ;
+        this.revSum += a * this.forwardSign;
+        this.revN += 1;
+        if (this.revN >= REVERSE_WINDOW_SAMPLES) {
+          this.isReversing = this.revSum / this.revN < -REVERSE_ACCEL_MIN;
+          this.revPending = false;
+        }
+      }
+      if (this.isReversing && speedRaw > REVERSE_MAX_KMH) this.isReversing = false;
     }
     if (obdFresh) this.previousSpeed = speedRaw;
 

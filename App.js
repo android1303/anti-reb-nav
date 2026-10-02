@@ -66,6 +66,10 @@ export default function App() {
     netLon: null,
     netAccuracy: null,
     netRxMs: 0,
+    fusedLat: null,
+    fusedLon: null,
+    fusedAccuracy: null,
+    fusedRxMs: 0,
     st: null, // останній gnssStatus
     stRxMs: 0,
     gyroX: 0,
@@ -134,6 +138,10 @@ export default function App() {
           netLon: d.netLon,
           netAccuracy: d.netAccuracy,
           netFixAgeMs: d.netRxMs ? now - d.netRxMs : null,
+          fusedLat: d.fusedLat,
+          fusedLon: d.fusedLon,
+          fusedAccuracy: d.fusedAccuracy,
+          fusedFixAgeMs: d.fusedRxMs ? now - d.fusedRxMs : null,
           gnssSatInView: stFresh ? d.st.satInView : null,
           gnssSatUsed: stFresh ? d.st.satUsed : null,
           gnssCn0MeanUsed: stFresh ? d.st.cn0MeanUsed : null,
@@ -278,13 +286,20 @@ export default function App() {
             d.netAccuracy = e.accuracy ?? null;
             d.netRxMs = Date.now();
           }),
+          gnssEmitter.addListener('gnssFusedFix', (e) => {
+            const d = latestData.current;
+            d.fusedLat = e.lat;
+            d.fusedLon = e.lon;
+            d.fusedAccuracy = e.accuracy ?? null;
+            d.fusedRxMs = Date.now();
+          }),
           gnssEmitter.addListener('gnssStatus', (e) => {
             latestData.current.st = e;
             latestData.current.stRxMs = Date.now();
           })
         );
         const started = await GnssModule.start();
-        if (!started.gps) console.warn('GPS_PROVIDER не запущено (вимкнено в системі?)', started);
+        if (!started.gps) console.warn('GPS_PROVIDER не запущено (немає на пристрої?)', started);
       } catch (e) {
         console.warn('Помилка GNSS:', e);
         setIsGpsEnabled(false);
@@ -304,6 +319,10 @@ export default function App() {
       d.netLon = null;
       d.netAccuracy = null;
       d.netRxMs = 0;
+      d.fusedLat = null;
+      d.fusedLon = null;
+      d.fusedAccuracy = null;
+      d.fusedRxMs = 0;
       d.st = null;
       d.stRxMs = 0;
     };

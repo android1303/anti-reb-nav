@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v18)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v19)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -69,9 +69,14 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  *     (мережева позиція окремо) і стан супутників gnssSatInView,
  *     gnssSatUsed, gnssCn0MeanUsed, gnssCn0MaxAll, gnssConstellations.
  *     Жодне з цих полів не впливає на heading, posX, posY, стан чи bias.
+ *
+ * Зміни v19 (TASK-013, лише формат лога; розрахунок без змін):
+ * 18. Fused-позиція Google окремо від GPS-приймача і мережі: колонки
+ *     fusedLat, fusedLon, fusedAccuracy, fusedFixAgeMs (у кінці CSV).
+ *     Потрібні, щоб визначити джерело позиції під час глушіння.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v18';
+export const CORE_VERSION = 'v19';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -124,6 +129,7 @@ export const CSV_COLUMNS = [
   'heading', 'posX', 'posY', 'pressure', 'altitude', 'lat', 'lon', 'gpsAccuracy',
   'gpsFixAgeMs', 'gpsMock', 'netLat', 'netLon', 'netAccuracy', 'netFixAgeMs',
   'gnssSatInView', 'gnssSatUsed', 'gnssCn0MeanUsed', 'gnssCn0MaxAll', 'gnssConstellations',
+  'fusedLat', 'fusedLon', 'fusedAccuracy', 'fusedFixAgeMs',
 ];
 
 const num = (v) => {
@@ -304,6 +310,7 @@ class TelemetryService {
     netLat = null, netLon = null, netAccuracy = null, netFixAgeMs = null,
     gnssSatInView = null, gnssSatUsed = null, gnssCn0MeanUsed = null, gnssCn0MaxAll = null,
     gnssConstellations = null,
+    fusedLat = null, fusedLon = null, fusedAccuracy = null, fusedFixAgeMs = null,
     timestamp,
   }) {
     if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
@@ -543,6 +550,10 @@ class TelemetryService {
       gnssCn0MeanUsed: numOrNull(gnssCn0MeanUsed),
       gnssCn0MaxAll: numOrNull(gnssCn0MaxAll),
       gnssConstellations: typeof gnssConstellations === 'string' && gnssConstellations ? gnssConstellations : null,
+      fusedLat: numOrNull(fusedLat),
+      fusedLon: numOrNull(fusedLon),
+      fusedAccuracy: numOrNull(fusedAccuracy),
+      fusedFixAgeMs: numOrNull(fusedFixAgeMs),
     };
 
     this.pendingPoints.push(entry);

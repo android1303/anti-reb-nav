@@ -21,10 +21,18 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.WritableMap
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 
 /**
- * Окремі потоки: GPS-приймач (GPS_PROVIDER), мережева позиція (NETWORK_PROVIDER)
- * і стан супутників (GnssStatus). Події: gnssGpsFix, gnssNetFix, gnssStatus.
+ * Окремі потоки: GPS-приймач (GPS_PROVIDER), мережева позиція (NETWORK_PROVIDER),
+ * fused-позиція Google (FusedLocationProviderClient, без діалогів SettingsClient)
+ * і стан супутників (GnssStatus).
+ * Події: gnssGpsFix, gnssNetFix, gnssFusedFix, gnssStatus.
  */
 class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
@@ -35,6 +43,8 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
     private var gpsListener: LocationListener? = null
     private var netListener: LocationListener? = null
     private var statusCallback: GnssStatus.Callback? = null
+    private var fusedClient: FusedLocationProviderClient? = null
+    private var fusedCallback: LocationCallback? = null
     private var lastStatusEmitMs = 0L
     private var running = false
 
@@ -95,9 +105,11 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
             }
 
             override fun onProviderEnabled(provider: String) {
+                Log.i(TAG, "Провайдер увімкнено: $provider")
             }
 
             override fun onProviderDisabled(provider: String) {
+                Log.i(TAG, "Провайдер вимкнено: $provider")
             }
         }
     }
@@ -154,16 +166,21 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         }
     }
 
-    /** Resolve: { gps, network, status } — які з трьох потоків реально запущено. */
+    private fun startedMap(): WritableMap {
+        return Arguments.createMap().apply {
+            putBoolean("gps", gpsListener != null)
+            putBoolean("network", netListener != null)
+            putBoolean("fused", fusedCallback != null)
+            putBoolean("status", statusCallback != null)
+        }
+    }
+
+    /** Resolve: { gps, network, fused, status } — які з потоків реально запущено. */
     @SuppressLint("MissingPermission")
     @ReactMethod
     fun start(promise: Promise) {
         if (running) {
-            promise.resolve(Arguments.createMap().apply {
-                putBoolean("gps", gpsListener != null)
-                putBoolean("network", netListener != null)
-                putBoolean("status", statusCallback != null)
-            })
+            promise.resolve(startedMap())
             return
         }
 
@@ -181,13 +198,18 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         locationManager = lm
         lastStatusEmitMs = 0L
 
+        // GPS_PROVIDER реєструємо й коли він зараз вимкнено: LocationManager приймає
+        // підписку і почне видавати фікси після ввімкнення геолокації в системі.
         try {
-            if (lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            if (lm.getProvider(LocationManager.GPS_PROVIDER) != null) {
                 val l = makeListener("gnssGpsFix")
                 lm.requestLocationUpdates(LocationManager.GPS_PROVIDER, 1000L, 0f, l, Looper.getMainLooper())
                 gpsListener = l
+                if (!lm.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+                    Log.w(TAG, "GPS_PROVIDER зараз вимкнено — чекаємо ввімкнення")
+                }
             } else {
-                Log.w(TAG, "GPS_PROVIDER вимкнено")
+                Log.w(TAG, "GPS_PROVIDER відсутній на пристрої")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Помилка запуску GPS_PROVIDER: ", e)
@@ -203,6 +225,25 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
             Log.e(TAG, "Помилка запуску NETWORK_PROVIDER: ", e)
         }
 
+        // Fused (Google Play Services). Без SettingsClient/checkLocationSettings — діалогу немає.
+        try {
+            val client = LocationServices.getFusedLocationProviderClient(ctx)
+            val request = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 1000L).build()
+            val cb = object : LocationCallback() {
+                override fun onLocationResult(result: LocationResult) {
+                    for (loc in result.locations) {
+                        emit("gnssFusedFix", fixToMap(loc))
+                    }
+                }
+            }
+            client.requestLocationUpdates(request, cb, Looper.getMainLooper())
+                .addOnFailureListener { e -> Log.e(TAG, "Fused недоступний: ", e) }
+            fusedClient = client
+            fusedCallback = cb
+        } catch (e: Exception) {
+            Log.e(TAG, "Помилка запуску fused: ", e)
+        }
+
         try {
             val cb = makeStatusCallback()
             if (lm.registerGnssStatusCallback(cb, mainHandler)) {
@@ -212,12 +253,8 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
             Log.e(TAG, "Помилка запуску GnssStatus: ", e)
         }
 
-        running = true
-        promise.resolve(Arguments.createMap().apply {
-            putBoolean("gps", gpsListener != null)
-            putBoolean("network", netListener != null)
-            putBoolean("status", statusCallback != null)
-        })
+        running = gpsListener != null || netListener != null || fusedCallback != null || statusCallback != null
+        promise.resolve(startedMap())
     }
 
     @ReactMethod
@@ -235,9 +272,22 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         } catch (e: Exception) {
             Log.e(TAG, "Помилка зупинки: ", e)
         }
+        try {
+            fusedCallback?.let { fusedClient?.removeLocationUpdates(it) }
+        } catch (e: Exception) {
+            Log.e(TAG, "Помилка зупинки fused: ", e)
+        }
         gpsListener = null
         netListener = null
         statusCallback = null
+        fusedCallback = null
+        fusedClient = null
         running = false
+    }
+
+    // Підписки не повинні переживати перезавантаження JS / знищення контексту
+    override fun invalidate() {
+        stopInternal()
+        super.invalidate()
     }
 }

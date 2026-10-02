@@ -3,7 +3,7 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v17)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v18)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -61,9 +61,17 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  *     (ZUPT_APPLY_TO_HEADING = false): у тестах №1 і №2 bias на стоянці
  *     мав протилежний знак до оптимального bias у русі — застосування
  *     погіршувало похибку (тест №2, пряма: 144.6 → 586.4 м).
+ *
+ * Зміни v18 (TASK-012, лише формат лога; розрахунок без змін):
+ * 17. lat/lon/gpsAccuracy тепер означають ЛИШЕ GPS-приймач (GPS_PROVIDER,
+ *     нативний GnssModule), а не fused-провайдер. Нові колонки в кінці
+ *     CSV: gpsFixAgeMs, gpsMock, netLat/netLon/netAccuracy/netFixAgeMs
+ *     (мережева позиція окремо) і стан супутників gnssSatInView,
+ *     gnssSatUsed, gnssCn0MeanUsed, gnssCn0MaxAll, gnssConstellations.
+ *     Жодне з цих полів не впливає на heading, posX, posY, стан чи bias.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v17';
+export const CORE_VERSION = 'v18';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -114,6 +122,8 @@ export const CSV_COLUMNS = [
   'filteredAccelX', 'filteredAccelY', 'filteredAccelZ',
   'forwardAxis', 'forwardSign', 'isAxesCalibrated', 'isReversing',
   'heading', 'posX', 'posY', 'pressure', 'altitude', 'lat', 'lon', 'gpsAccuracy',
+  'gpsFixAgeMs', 'gpsMock', 'netLat', 'netLon', 'netAccuracy', 'netFixAgeMs',
+  'gnssSatInView', 'gnssSatUsed', 'gnssCn0MeanUsed', 'gnssCn0MaxAll', 'gnssConstellations',
 ];
 
 const num = (v) => {
@@ -121,6 +131,9 @@ const num = (v) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
+
+const numOrNull = (v) =>
+  v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v);
 
 const median = (arr) => {
   const s = [...arr].sort((a, b) => a - b);
@@ -287,6 +300,10 @@ class TelemetryService {
     lat = null,
     lon = null,
     gpsAccuracy = null,
+    gpsFixAgeMs = null, gpsMock = null,
+    netLat = null, netLon = null, netAccuracy = null, netFixAgeMs = null,
+    gnssSatInView = null, gnssSatUsed = null, gnssCn0MeanUsed = null, gnssCn0MaxAll = null,
+    gnssConstellations = null,
     timestamp,
   }) {
     if (typeof timestamp !== 'number' || !Number.isFinite(timestamp)) {
@@ -514,6 +531,18 @@ class TelemetryService {
         gpsAccuracy !== null && gpsAccuracy !== undefined && Number.isFinite(Number(gpsAccuracy))
           ? Number(gpsAccuracy)
           : null,
+      // Лише логування (TASK-012): у розрахунку не беруть участі
+      gpsFixAgeMs: numOrNull(gpsFixAgeMs),
+      gpsMock: typeof gpsMock === 'boolean' ? gpsMock : null,
+      netLat: numOrNull(netLat),
+      netLon: numOrNull(netLon),
+      netAccuracy: numOrNull(netAccuracy),
+      netFixAgeMs: numOrNull(netFixAgeMs),
+      gnssSatInView: numOrNull(gnssSatInView),
+      gnssSatUsed: numOrNull(gnssSatUsed),
+      gnssCn0MeanUsed: numOrNull(gnssCn0MeanUsed),
+      gnssCn0MaxAll: numOrNull(gnssCn0MaxAll),
+      gnssConstellations: typeof gnssConstellations === 'string' && gnssConstellations ? gnssConstellations : null,
     };
 
     this.pendingPoints.push(entry);

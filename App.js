@@ -9,6 +9,8 @@ import {
   StatusBar,
   PermissionsAndroid,
   Alert,
+  NativeModules,
+  NativeEventEmitter,
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
@@ -20,6 +22,11 @@ import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
 
 const OBD_STALE_MS = 2000;
+const GPS_FIX_STALE_MS = 3000; // довше — на екрані «GPS: немає»
+const GNSS_STATUS_STALE_MS = 5000; // старіший стан супутників у лог не пишемо (null)
+
+const { GnssModule } = NativeModules;
+const gnssEmitter = GnssModule ? new NativeEventEmitter(GnssModule) : null;
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
 const formatHHMMSS = (ms) => {
@@ -32,7 +39,7 @@ export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
   const [obdStale, setObdStale] = useState(true);
   const [currentPressure, setCurrentPressure] = useState(0);
-  const [location, setLocation] = useState(null);
+  const [gnssView, setGnssView] = useState({ hasFix: false, lat: null, lon: null, satUsed: null, satInView: null });
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
 
   const [bufferCount, setBufferCount] = useState(0);
@@ -50,9 +57,17 @@ export default function App() {
   const latestData = useRef({
     speed: 0,
     pressure: 0,
-    lat: null,
+    lat: null, // лише GPS-приймач (GPS_PROVIDER); тримається між фіксами
     lon: null,
     gpsAccuracy: null,
+    gpsMock: null,
+    gpsRxMs: 0, // Date.now() прийому останнього GPS-фіксу; 0 = не було
+    netLat: null,
+    netLon: null,
+    netAccuracy: null,
+    netRxMs: 0,
+    st: null, // останній gnssStatus
+    stRxMs: 0,
     gyroX: 0,
     gyroY: 0,
     gyroZ: 0,
@@ -68,12 +83,6 @@ export default function App() {
   useEffect(() => {
     latestData.current.pressure = currentPressure;
   }, [currentPressure]);
-
-  useEffect(() => {
-    latestData.current.lat = location?.coords?.latitude ?? null;
-    latestData.current.lon = location?.coords?.longitude ?? null;
-    latestData.current.gpsAccuracy = location?.coords?.accuracy ?? null;
-  }, [location]);
 
   // Ініціалізація телеметрії (працює і без Firestore — лише локально)
   useEffect(() => {
@@ -102,6 +111,7 @@ export default function App() {
       try {
         const now = Date.now();
         const d = latestData.current;
+        const stFresh = !!d.st && now - d.stRxMs <= GNSS_STATUS_STALE_MS;
         telemetry.recordPoint({
           speed: d.speed,
           obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
@@ -118,6 +128,17 @@ export default function App() {
           lat: d.lat,
           lon: d.lon,
           gpsAccuracy: d.gpsAccuracy,
+          gpsFixAgeMs: d.gpsRxMs ? now - d.gpsRxMs : null,
+          gpsMock: d.gpsMock,
+          netLat: d.netLat,
+          netLon: d.netLon,
+          netAccuracy: d.netAccuracy,
+          netFixAgeMs: d.netRxMs ? now - d.netRxMs : null,
+          gnssSatInView: stFresh ? d.st.satInView : null,
+          gnssSatUsed: stFresh ? d.st.satUsed : null,
+          gnssCn0MeanUsed: stFresh ? d.st.cn0MeanUsed : null,
+          gnssCn0MaxAll: stFresh ? d.st.cn0MaxAll : null,
+          gnssConstellations: stFresh ? d.st.constellationsUsed : null,
           timestamp: now,
         });
       } catch (err) {
@@ -141,6 +162,15 @@ export default function App() {
       setSyncState(telemetry.getSyncState());
       const last = latestData.current.lastObdUpdateTime;
       setObdStale(!last || Date.now() - last > OBD_STALE_MS);
+      const g = latestData.current;
+      const nowMs = Date.now();
+      setGnssView({
+        hasFix: !!g.gpsRxMs && nowMs - g.gpsRxMs <= GPS_FIX_STALE_MS,
+        lat: g.lat,
+        lon: g.lon,
+        satUsed: g.st ? g.st.satUsed : null,
+        satInView: g.st ? g.st.satInView : null,
+      });
     }, 500);
     return () => clearInterval(ui);
   }, []);
@@ -217,30 +247,66 @@ export default function App() {
     return () => sub && sub.remove();
   }, []);
 
-  // Еталонний GPS (Ground Truth, у розрахунках не бере участі)
+  // Еталонний GPS (Ground Truth, у розрахунках не бере участі).
+  // Нативний GnssModule: GPS-приймач, мережева позиція і стан супутників окремо.
+  // Без Location.watchPositionAsync — він показує діалог «Точна геолокація».
   useEffect(() => {
-    let sub;
+    if (!isGpsEnabled || !gnssEmitter) return undefined;
+    let cancelled = false;
+    const subs = [];
     (async () => {
       try {
-        if (isGpsEnabled) {
-          const { status } = await Location.requestForegroundPermissionsAsync();
-          if (status === 'granted') {
-            sub = await Location.watchPositionAsync(
-              { accuracy: Location.Accuracy.BestForNavigation, timeInterval: 1000, distanceInterval: 0 },
-              (loc) => setLocation(loc)
-            );
-          } else {
-            setIsGpsEnabled(false);
-          }
-        } else {
-          setLocation(null);
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== 'granted') {
+          setIsGpsEnabled(false);
+          return;
         }
+        if (cancelled) return;
+        subs.push(
+          gnssEmitter.addListener('gnssGpsFix', (e) => {
+            const d = latestData.current;
+            d.lat = e.lat;
+            d.lon = e.lon;
+            d.gpsAccuracy = e.accuracy ?? null;
+            d.gpsMock = typeof e.isMock === 'boolean' ? e.isMock : null;
+            d.gpsRxMs = Date.now();
+          }),
+          gnssEmitter.addListener('gnssNetFix', (e) => {
+            const d = latestData.current;
+            d.netLat = e.lat;
+            d.netLon = e.lon;
+            d.netAccuracy = e.accuracy ?? null;
+            d.netRxMs = Date.now();
+          }),
+          gnssEmitter.addListener('gnssStatus', (e) => {
+            latestData.current.st = e;
+            latestData.current.stRxMs = Date.now();
+          })
+        );
+        const started = await GnssModule.start();
+        if (!started.gps) console.warn('GPS_PROVIDER не запущено (вимкнено в системі?)', started);
       } catch (e) {
-        console.warn('Помилка GPS:', e);
+        console.warn('Помилка GNSS:', e);
         setIsGpsEnabled(false);
       }
     })();
-    return () => sub && sub.remove();
+    return () => {
+      cancelled = true;
+      subs.forEach((sub) => sub.remove());
+      GnssModule.stop().catch(() => {});
+      const d = latestData.current;
+      d.lat = null;
+      d.lon = null;
+      d.gpsAccuracy = null;
+      d.gpsMock = null;
+      d.gpsRxMs = 0;
+      d.netLat = null;
+      d.netLon = null;
+      d.netAccuracy = null;
+      d.netRxMs = 0;
+      d.st = null;
+      d.stRxMs = 0;
+    };
   }, [isGpsEnabled]);
 
   const connectBluetooth = async () => {
@@ -424,9 +490,11 @@ export default function App() {
         <View style={styles.card}>
           <Text style={styles.cardLabel}>GROUND TRUTH GPS</Text>
           <Text style={styles.cardValueSmall}>
-            {location
-              ? `${location.coords.latitude.toFixed(5)}\n${location.coords.longitude.toFixed(5)}`
-              : 'Очікування GPS'}
+            {!isGpsEnabled
+              ? 'GPS вимкнено'
+              : gnssView.hasFix
+              ? `${gnssView.lat.toFixed(5)}\n${gnssView.lon.toFixed(5)}`
+              : `GPS: немає (супутн. ${gnssView.satUsed ?? '?'}/${gnssView.satInView ?? '?'})`}
           </Text>
         </View>
       </View>

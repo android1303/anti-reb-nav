@@ -216,10 +216,17 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         }
 
         try {
-            if (lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+            // Як і GPS: реєструємо незалежно від поточного стану — фікси підуть,
+            // щойно мережева геолокація стане доступною.
+            if (lm.allProviders.contains(LocationManager.NETWORK_PROVIDER)) {
                 val l = makeListener("gnssNetFix")
                 lm.requestLocationUpdates(LocationManager.NETWORK_PROVIDER, 1000L, 0f, l, Looper.getMainLooper())
                 netListener = l
+                if (!lm.isProviderEnabled(LocationManager.NETWORK_PROVIDER)) {
+                    Log.w(TAG, "NETWORK_PROVIDER зараз вимкнено — чекаємо ввімкнення")
+                }
+            } else {
+                Log.w(TAG, "NETWORK_PROVIDER відсутній на пристрої")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Помилка запуску NETWORK_PROVIDER: ", e)

@@ -9,6 +9,7 @@ import {
   StatusBar,
   PermissionsAndroid,
   Alert,
+  AppState,
   NativeModules,
   NativeEventEmitter,
 } from 'react-native';
@@ -17,6 +18,7 @@ import * as Sharing from 'expo-sharing';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
+import { bgTick } from './bgScheduler';
 import telemetry, { CORE_VERSION } from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
@@ -25,8 +27,12 @@ const OBD_STALE_MS = 2000;
 const GPS_FIX_STALE_MS = 3000; // довше — на екрані «GPS: немає»
 const GNSS_STATUS_STALE_MS = 5000; // старіший стан супутників у лог не пишемо (null)
 
-const { GnssModule } = NativeModules;
+const EXPO_SENSOR_STALE_MS = 500; // expo-sensors мовчать (фон) — у лог пишемо null
+const NATIVE_TICK_STALE_MS = 200; // нативний такт зник — працює запасний setInterval
+
+const { GnssModule, SensorModule } = NativeModules;
 const gnssEmitter = GnssModule ? new NativeEventEmitter(GnssModule) : null;
+const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null;
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
 const formatHHMMSS = (ms) => {
@@ -46,6 +52,7 @@ export default function App() {
   const [syncState, setSyncState] = useState(telemetry.getSyncState());
   const [syncError, setSyncError] = useState(null);
   const syncErrorTimer = useRef(null);
+  const isRecordingRef = useRef(false);
   const [isExporting, setIsExporting] = useState(false);
 
   const [isRecording, setIsRecording] = useState(false);
@@ -72,6 +79,15 @@ export default function App() {
     fusedRxMs: 0,
     st: null, // останній gnssStatus
     stRxMs: 0,
+    // expo-sensors (працюють лише поки застосунок на екрані)
+    expoGyroTs: 0,
+    expoMotionTs: 0,
+    // нативний SensorModule (працює і у фоні) + нативний такт
+    lastNativeTickMs: 0,
+    nGyroX: null, nGyroY: null, nGyroZ: null,
+    nAccX: null, nAccY: null, nAccZ: null,
+    nGravX: null, nGravY: null, nGravZ: null,
+    nGyroAgeMs: null, nAccAgeMs: null, nGravAgeMs: null,
     gyroX: 0,
     gyroY: 0,
     gyroZ: 0,
@@ -107,54 +123,106 @@ export default function App() {
     };
   }, []);
 
-  // Цикл ядра 20 Гц. recordPoint синхронний — тики не накладаються.
-  // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
   useEffect(() => {
-    if (!isRecording) return undefined;
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  // Одна точка ядра. recordPoint синхронний — тики не накладаються.
+  // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
+  // Використовує лише ref-и і модулі, тож безпечно викликається із будь-яких ефектів.
+  const runCoreTick = (now) => {
+    try {
+      const d = latestData.current;
+      const stFresh = !!d.st && now - d.stRxMs <= GNSS_STATUS_STALE_MS;
+      const expoGyroOk = !!d.expoGyroTs && now - d.expoGyroTs <= EXPO_SENSOR_STALE_MS;
+      const expoMotionOk = !!d.expoMotionTs && now - d.expoMotionTs <= EXPO_SENSOR_STALE_MS;
+      const nativeOk = !!d.lastNativeTickMs && now - d.lastNativeTickMs <= NATIVE_TICK_STALE_MS;
+      const age = (rx) => (rx ? Math.max(0, now - rx) : null);
+      telemetry.recordPoint({
+        speed: d.speed,
+        obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
+        // expo-sensors: паралельний запис (null, коли вони мовчать у фоні)
+        gyroX: expoGyroOk ? d.gyroX : null,
+        gyroY: expoGyroOk ? d.gyroY : null,
+        gyroZ: expoGyroOk ? d.gyroZ : null,
+        accelX: expoMotionOk ? d.accelX : null,
+        accelY: expoMotionOk ? d.accelY : null,
+        accelZ: expoMotionOk ? d.accelZ : null,
+        gravX: expoMotionOk ? d.gravX : null,
+        gravY: expoMotionOk ? d.gravY : null,
+        gravZ: expoMotionOk ? d.gravZ : null,
+        // нативні датчики: джерело входів ядра, коли є
+        nGyroX: nativeOk ? d.nGyroX : null,
+        nGyroY: nativeOk ? d.nGyroY : null,
+        nGyroZ: nativeOk ? d.nGyroZ : null,
+        nAccX: nativeOk ? d.nAccX : null,
+        nAccY: nativeOk ? d.nAccY : null,
+        nAccZ: nativeOk ? d.nAccZ : null,
+        nGravX: nativeOk ? d.nGravX : null,
+        nGravY: nativeOk ? d.nGravY : null,
+        nGravZ: nativeOk ? d.nGravZ : null,
+        nGyroAgeMs: nativeOk ? d.nGyroAgeMs : null,
+        nAccAgeMs: nativeOk ? d.nAccAgeMs : null,
+        nGravAgeMs: nativeOk ? d.nGravAgeMs : null,
+        appState: AppState.currentState,
+        pressure: d.pressure,
+        lat: d.lat,
+        lon: d.lon,
+        gpsAccuracy: d.gpsAccuracy,
+        gpsFixAgeMs: age(d.gpsRxMs),
+        gpsMock: d.gpsMock,
+        netLat: d.netLat,
+        netLon: d.netLon,
+        netAccuracy: d.netAccuracy,
+        netFixAgeMs: age(d.netRxMs),
+        fusedLat: d.fusedLat,
+        fusedLon: d.fusedLon,
+        fusedAccuracy: d.fusedAccuracy,
+        fusedFixAgeMs: age(d.fusedRxMs),
+        gnssSatInView: stFresh ? d.st.satInView : null,
+        gnssSatUsed: stFresh ? d.st.satUsed : null,
+        gnssCn0MeanUsed: stFresh ? d.st.cn0MeanUsed : null,
+        gnssCn0MaxAll: stFresh ? d.st.cn0MaxAll : null,
+        gnssConstellations: stFresh ? d.st.constellationsUsed : null,
+        timestamp: now,
+      });
+    } catch (err) {
+      console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
+    }
+  };
+
+  // Нативний такт 20 Гц (SensorModule): працює у фоні й з вимкненим екраном, на відміну від
+  // таймерів JS. Від нього йдуть: цикл ядра, таймери OBD і flush логу (bgScheduler).
+  useEffect(() => {
+    if (!sensorEmitter) return undefined;
+    const sub = sensorEmitter.addListener('nativeSensors', (e) => {
+      const d = latestData.current;
+      const now = typeof e.tMs === 'number' ? e.tMs : Date.now();
+      d.lastNativeTickMs = now;
+      d.nGyroX = e.gyroX; d.nGyroY = e.gyroY; d.nGyroZ = e.gyroZ;
+      d.nAccX = e.accX; d.nAccY = e.accY; d.nAccZ = e.accZ;
+      d.nGravX = e.gravX; d.nGravY = e.gravY; d.nGravZ = e.gravZ;
+      d.nGyroAgeMs = e.gyroAgeMs; d.nAccAgeMs = e.accAgeMs; d.nGravAgeMs = e.gravAgeMs;
+      bgTick(now);
+      if (isRecordingRef.current) runCoreTick(now);
+    });
+    SensorModule.start().catch((err) => console.warn('SensorModule.start:', err));
+    return () => {
+      sub.remove();
+      SensorModule.stop().catch(() => {});
+    };
+  }, []);
+
+  // Запасний цикл, якщо нативних тактів немає (SensorModule не запустився)
+  useEffect(() => {
     const interval = setInterval(() => {
-      try {
-        const now = Date.now();
-        const d = latestData.current;
-        const stFresh = !!d.st && now - d.stRxMs <= GNSS_STATUS_STALE_MS;
-        telemetry.recordPoint({
-          speed: d.speed,
-          obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
-          gyroX: d.gyroX,
-          gyroY: d.gyroY,
-          gyroZ: d.gyroZ,
-          accelX: d.accelX,
-          accelY: d.accelY,
-          accelZ: d.accelZ,
-          gravX: d.gravX,
-          gravY: d.gravY,
-          gravZ: d.gravZ,
-          pressure: d.pressure,
-          lat: d.lat,
-          lon: d.lon,
-          gpsAccuracy: d.gpsAccuracy,
-          gpsFixAgeMs: d.gpsRxMs ? now - d.gpsRxMs : null,
-          gpsMock: d.gpsMock,
-          netLat: d.netLat,
-          netLon: d.netLon,
-          netAccuracy: d.netAccuracy,
-          netFixAgeMs: d.netRxMs ? now - d.netRxMs : null,
-          fusedLat: d.fusedLat,
-          fusedLon: d.fusedLon,
-          fusedAccuracy: d.fusedAccuracy,
-          fusedFixAgeMs: d.fusedRxMs ? now - d.fusedRxMs : null,
-          gnssSatInView: stFresh ? d.st.satInView : null,
-          gnssSatUsed: stFresh ? d.st.satUsed : null,
-          gnssCn0MeanUsed: stFresh ? d.st.cn0MeanUsed : null,
-          gnssCn0MaxAll: stFresh ? d.st.cn0MaxAll : null,
-          gnssConstellations: stFresh ? d.st.constellationsUsed : null,
-          timestamp: now,
-        });
-      } catch (err) {
-        console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
-      }
+      if (!isRecordingRef.current) return;
+      const now = Date.now();
+      if (now - latestData.current.lastNativeTickMs < NATIVE_TICK_STALE_MS) return;
+      runCoreTick(now);
     }, 50);
     return () => clearInterval(interval);
-  }, [isRecording]);
+  }, []);
 
   // Екран не гасне під час запису: інакше Android душить JS-таймери 20 Гц
   useEffect(() => {
@@ -217,6 +285,7 @@ export default function App() {
             latestData.current.gyroX = data.x;
             latestData.current.gyroY = data.y;
             latestData.current.gyroZ = data.z;
+            latestData.current.expoGyroTs = Date.now();
           });
         }
       } catch (e) {
@@ -236,6 +305,7 @@ export default function App() {
           sub = DeviceMotion.addListener((data) => {
             const a = data?.acceleration;
             const ag = data?.accelerationIncludingGravity;
+            latestData.current.expoMotionTs = Date.now();
             if (a) {
               latestData.current.accelX = a.x || 0;
               latestData.current.accelY = a.y || 0;
@@ -377,12 +447,28 @@ export default function App() {
 
   const toggleRecording = async () => {
     if (!isRecording) {
+      // Android 13+: без дозволу сповіщення foreground service все одно працює, але його не видно
+      if (Platform.OS === 'android' && Platform.Version >= 33) {
+        try {
+          await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+        } catch (e) {
+          console.warn('POST_NOTIFICATIONS:', e);
+        }
+      }
+      if (SensorModule) {
+        try {
+          await SensorModule.startRecordingService();
+        } catch (e) {
+          console.warn('RecordingService не запущено (запис піде без фонового сервісу):', e);
+        }
+      }
       telemetry.startSession();
       setNav(telemetry.getNavState());
       setIsRecording(true);
     } else {
       setIsRecording(false);
       await telemetry.stopSession();
+      if (SensorModule) SensorModule.stopRecordingService().catch(() => {});
     }
   };
 

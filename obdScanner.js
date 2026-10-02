@@ -1,4 +1,5 @@
 import { NativeModules, NativeEventEmitter } from 'react-native';
+import { setBgTimeout, clearBgTimeout } from './bgScheduler';
 
 const { Elm327Module } = NativeModules;
 const elmEmitter = new NativeEventEmitter(Elm327Module);
@@ -144,7 +145,7 @@ class OBDScanner {
     }
 
     const timeout = this.gotFirstResponse ? RESPONSE_TIMEOUT_MS : FIRST_RESPONSE_TIMEOUT_MS;
-    this.responseTimer = setTimeout(() => {
+    this.responseTimer = setBgTimeout(() => {
       if (!this.isPolling) return;
       this._status('Немає відповіді ECU...');
       this.buffer = '';
@@ -155,8 +156,8 @@ class OBDScanner {
   _scheduleNextRequest() {
     if (!this.isPolling || !this.awaitingResponse) return; // захист від подвійного циклу
     this.awaitingResponse = false;
-    if (this.responseTimer) clearTimeout(this.responseTimer);
-    this.nextRequestTimer = setTimeout(() => this._sendSpeedRequest(), POLL_GAP_MS);
+    if (this.responseTimer) clearBgTimeout(this.responseTimer);
+    this.nextRequestTimer = setBgTimeout(() => this._sendSpeedRequest(), POLL_GAP_MS);
   }
 
   processBuffer() {
@@ -191,8 +192,8 @@ class OBDScanner {
   }
 
   _clearTimers() {
-    if (this.responseTimer) clearTimeout(this.responseTimer);
-    if (this.nextRequestTimer) clearTimeout(this.nextRequestTimer);
+    if (this.responseTimer) clearBgTimeout(this.responseTimer);
+    if (this.nextRequestTimer) clearBgTimeout(this.nextRequestTimer);
     this.responseTimer = null;
     this.nextRequestTimer = null;
   }

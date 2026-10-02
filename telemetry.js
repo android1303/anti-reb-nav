@@ -1,9 +1,10 @@
 import NetInfo from '@react-native-community/netinfo';
 import * as FileSystem from 'expo-file-system/legacy';
 import { collection, writeBatch, doc } from 'firebase/firestore';
+import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v19)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v20)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -74,9 +75,20 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
  * 18. Fused-позиція Google окремо від GPS-приймача і мережі: колонки
  *     fusedLat, fusedLon, fusedAccuracy, fusedFixAgeMs (у кінці CSV).
  *     Потрібні, щоб визначити джерело позиції під час глушіння.
+ *
+ * Зміни v20 (TASK-016, математика без змін):
+ * 19. Входи ядра (гіроскоп, лінійне прискорення, гравітація) беруться з
+ *     нативного SensorModule (працює у фоні й з вимкненим екраном), якщо всі
+ *     9 значень є; інакше — з expo-sensors як раніше (sensorSource =
+ *     "native" | "expo"). Колонки gyroXRaw…/accelX…/gravX… далі пишуть
+ *     значення expo (порожньо, коли expo-sensors у фоні мовчать) — паралельний
+ *     запис для перевірки еквівалентності; нативні — nGyroX…, nAccX…, nGravX…
+ *     (+ вік кожного датчика) і appState.
+ * 20. flush логу йде через bgScheduler (нативний такт), а не лише через
+ *     setInterval, який у фоні призупиняється.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v19';
+export const CORE_VERSION = 'v20';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -130,6 +142,8 @@ export const CSV_COLUMNS = [
   'gpsFixAgeMs', 'gpsMock', 'netLat', 'netLon', 'netAccuracy', 'netFixAgeMs',
   'gnssSatInView', 'gnssSatUsed', 'gnssCn0MeanUsed', 'gnssCn0MaxAll', 'gnssConstellations',
   'fusedLat', 'fusedLon', 'fusedAccuracy', 'fusedFixAgeMs',
+  'nGyroX', 'nGyroY', 'nGyroZ', 'nAccX', 'nAccY', 'nAccZ', 'nGravX', 'nGravY', 'nGravZ',
+  'nGyroAgeMs', 'nAccAgeMs', 'nGravAgeMs', 'sensorSource', 'appState',
 ];
 
 const num = (v) => {
@@ -276,15 +290,15 @@ class TelemetryService {
     this.resetNavigation();
     this.pendingPoints = [];
     this.sessionId = `s_${Date.now()}`;
-    if (this.flushTimer) clearInterval(this.flushTimer);
-    this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS);
+    if (this.flushTimer) clearBgInterval(this.flushTimer);
+    this.flushTimer = setBgInterval(() => this.flush(), FLUSH_INTERVAL_MS);
     return this.sessionId;
   }
 
   async stopSession() {
     this.isRecording = false;
     if (this.flushTimer) {
-      clearInterval(this.flushTimer);
+      clearBgInterval(this.flushTimer);
       this.flushTimer = null;
     }
     await this.flush();
@@ -299,9 +313,14 @@ class TelemetryService {
   recordPoint({
     speed = 0,
     obdAgeMs = Infinity,
-    gyroX = 0, gyroY = 0, gyroZ = 0, // рад/с (expo-sensors)
-    accelX = 0, accelY = 0, accelZ = 0,
-    gravX = 0, gravY = 0, gravZ = 0,
+    gyroX = null, gyroY = null, gyroZ = null, // рад/с (expo-sensors; null — немає)
+    accelX = null, accelY = null, accelZ = null,
+    gravX = null, gravY = null, gravZ = null,
+    nGyroX = null, nGyroY = null, nGyroZ = null, // рад/с (нативний SensorModule)
+    nAccX = null, nAccY = null, nAccZ = null,
+    nGravX = null, nGravY = null, nGravZ = null,
+    nGyroAgeMs = null, nAccAgeMs = null, nGravAgeMs = null,
+    appState = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -320,9 +339,20 @@ class TelemetryService {
 
     // --- 0. Вхідні дані ---
     const speedRaw = num(speed);
-    const gX = num(gyroX), gY = num(gyroY), gZ = num(gyroZ);
-    let aX = num(accelX), aY = num(accelY), aZ = num(accelZ);
-    const grX = num(gravX), grY = num(gravY), grZ = num(gravZ);
+    // Джерело входів: нативне, якщо є всі 9 значень, інакше expo (як до v20)
+    const hasNative = [nGyroX, nGyroY, nGyroZ, nAccX, nAccY, nAccZ, nGravX, nGravY, nGravZ].every(
+      (v) => v !== null && v !== undefined && Number.isFinite(Number(v))
+    );
+    const sensorSource = hasNative ? 'native' : 'expo';
+    const gX = num(hasNative ? nGyroX : gyroX);
+    const gY = num(hasNative ? nGyroY : gyroY);
+    const gZ = num(hasNative ? nGyroZ : gyroZ);
+    let aX = num(hasNative ? nAccX : accelX);
+    let aY = num(hasNative ? nAccY : accelY);
+    let aZ = num(hasNative ? nAccZ : accelZ);
+    const grX = num(hasNative ? nGravX : gravX);
+    const grY = num(hasNative ? nGravY : gravY);
+    const grZ = num(hasNative ? nGravZ : gravZ);
     const pressureRaw = num(pressure);
 
     const obdFresh = Number.isFinite(obdAgeMs) && obdAgeMs <= OBD_STALE_MS;
@@ -492,6 +522,12 @@ class TelemetryService {
     this.posX += distance * Math.sin(hRad);
     this.posY += distance * Math.cos(hRad);
 
+    // expo-прискорення в лозі, як і раніше, обнуляються в STOPPED
+    const expoAccLog = (v) => {
+      const x = numOrNull(v);
+      return x === null ? null : isStopped ? 0 : x;
+    };
+
     const entry = {
       timestamp,
       createdAt: new Date(timestamp).toISOString(),
@@ -504,15 +540,16 @@ class TelemetryService {
       speedExtrapolated,
       obdAgeMs: Number.isFinite(obdAgeMs) ? obdAgeMs : -1,
       obdFresh,
-      gyroXRaw: gX,
-      gyroYRaw: gY,
-      gyroZRaw: gZ,
-      accelX: aX,
-      accelY: aY,
-      accelZ: aZ,
-      gravX: grX,
-      gravY: grY,
-      gravZ: grZ,
+      // Паралельний запис expo-sensors (null, якщо вони не віддавали значень)
+      gyroXRaw: numOrNull(gyroX),
+      gyroYRaw: numOrNull(gyroY),
+      gyroZRaw: numOrNull(gyroZ),
+      accelX: expoAccLog(accelX),
+      accelY: expoAccLog(accelY),
+      accelZ: expoAccLog(accelZ),
+      gravX: numOrNull(gravX),
+      gravY: numOrNull(gravY),
+      gravZ: numOrNull(gravZ),
       gravityValid,
       yawRateRaw,
       yawRateValid,
@@ -554,6 +591,20 @@ class TelemetryService {
       fusedLon: numOrNull(fusedLon),
       fusedAccuracy: numOrNull(fusedAccuracy),
       fusedFixAgeMs: numOrNull(fusedFixAgeMs),
+      nGyroX: numOrNull(nGyroX),
+      nGyroY: numOrNull(nGyroY),
+      nGyroZ: numOrNull(nGyroZ),
+      nAccX: numOrNull(nAccX),
+      nAccY: numOrNull(nAccY),
+      nAccZ: numOrNull(nAccZ),
+      nGravX: numOrNull(nGravX),
+      nGravY: numOrNull(nGravY),
+      nGravZ: numOrNull(nGravZ),
+      nGyroAgeMs: numOrNull(nGyroAgeMs),
+      nAccAgeMs: numOrNull(nAccAgeMs),
+      nGravAgeMs: numOrNull(nGravAgeMs),
+      sensorSource,
+      appState: typeof appState === 'string' && appState ? appState : null,
     };
 
     this.pendingPoints.push(entry);

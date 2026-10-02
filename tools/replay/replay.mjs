@@ -2,13 +2,16 @@
 /**
  * Відтворення заїзду: подає сирі колонки CSV у справжнє ядро telemetry.js.
  *
- *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId]
+ *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId] [--sensors=expo]
  *
  * За замовчуванням ядро = ./telemetry.js, вихід = replay_out.csv.
  * Щоб перевірити інші константи — скопіюй telemetry.js у тимчасовий файл,
  * зміни константу і передай його третім аргументом.
  * sessionId (4-й аргумент, опційно): відтворити лише рядки з цим sessionId
  * (для кумулятивних дампів з кількома сесіями).
+ * Входи датчиків (v20): якщо в CSV є нативні колонки nGyroX…nGravZ і вони не порожні —
+ * ядро бере їх (sensorSource=native), інакше — старі gyroXRaw/accelX/gravX (expo).
+ * --sensors=expo примусово ігнорує нативні колонки (порівняння еквівалентності).
  * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
@@ -18,9 +21,11 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js', sessionId] = process.argv;
+const argv = process.argv.filter((a) => !a.startsWith('--'));
+const forceExpo = process.argv.includes('--sensors=expo');
+const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js', sessionId] = argv;
 if (!csvPath) {
-  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId]');
+  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId] [--sensors=expo]');
   process.exit(1);
 }
 
@@ -74,11 +79,17 @@ const num = (cells, k) => {
   const v = cells[col[k]]?.replace(/^"|"$/g, '');
   return v === '' || v === undefined ? NaN : Number(v);
 };
+// Колонки датчиків: відсутня/порожня комірка = null (датчик не віддавав значення)
+const numOrNull = (cells, k) => {
+  if (!(k in col)) return null;
+  const v = cells[col[k]]?.replace(/^"|"$/g, '');
+  return v === '' || v === undefined || !Number.isFinite(Number(v)) ? null : Number(v);
+};
 
 telemetry.startSession();
 const outCols = ['timestamp', 'currentState', 'speedUsed', 'speedExtrapolated', 'gapS', 'yawRateClean',
   'gyroBias', 'zuptApplied', 'heading', 'posX', 'posY', 'lat', 'lon',
-  'forwardAxis', 'forwardSign', 'isReversing'];
+  'forwardAxis', 'forwardSign', 'isReversing', 'sensorSource'];
 const out = [outCols.join(',')];
 for (const line of lines.slice(1)) {
   const c = line.split(',');
@@ -86,9 +97,16 @@ for (const line of lines.slice(1)) {
   const lat = num(c, 'lat'), lon = num(c, 'lon');
   const e = telemetry.recordPoint({
     speed: num(c, 'speedRaw'), obdAgeMs: num(c, 'obdAgeMs'),
-    gyroX: num(c, 'gyroXRaw'), gyroY: num(c, 'gyroYRaw'), gyroZ: num(c, 'gyroZRaw'),
-    accelX: num(c, 'accelX') || 0, accelY: num(c, 'accelY') || 0, accelZ: num(c, 'accelZ') || 0,
-    gravX: num(c, 'gravX'), gravY: num(c, 'gravY'), gravZ: num(c, 'gravZ'),
+    gyroX: numOrNull(c, 'gyroXRaw'), gyroY: numOrNull(c, 'gyroYRaw'), gyroZ: numOrNull(c, 'gyroZRaw'),
+    accelX: numOrNull(c, 'accelX'), accelY: numOrNull(c, 'accelY'), accelZ: numOrNull(c, 'accelZ'),
+    gravX: numOrNull(c, 'gravX'), gravY: numOrNull(c, 'gravY'), gravZ: numOrNull(c, 'gravZ'),
+    ...(forceExpo
+      ? {}
+      : {
+          nGyroX: numOrNull(c, 'nGyroX'), nGyroY: numOrNull(c, 'nGyroY'), nGyroZ: numOrNull(c, 'nGyroZ'),
+          nAccX: numOrNull(c, 'nAccX'), nAccY: numOrNull(c, 'nAccY'), nAccZ: numOrNull(c, 'nAccZ'),
+          nGravX: numOrNull(c, 'nGravX'), nGravY: numOrNull(c, 'nGravY'), nGravZ: numOrNull(c, 'nGravZ'),
+        }),
     pressure: num(c, 'pressure') || 0,
     lat: Number.isFinite(lat) ? lat : null, lon: Number.isFinite(lon) ? lon : null,
     timestamp: num(c, 'timestamp'),

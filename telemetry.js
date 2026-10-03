@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v22)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v23)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -98,9 +98,14 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  *     mock location: колонки mockActive, mockLat, mockLon, mockAccuracy,
  *     mockBearing, anchorAgeS, headingOffsetDeg, anchorState. Це окремий шар
  *     поверх ядра: heading, posX, posY він не змінює.
+ *
+ * Зміни v23 (TASK-019, лише формат лога; розрахунок без змін):
+ * 23. Колонка mockMode ("fused" | "fusedGps" | null) — режим підміни
+ *     геолокації. У режимі "fused" підміняється лише fused, а справжній
+ *     GPS_PROVIDER лишається видимим застосунку.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v22';
+export const CORE_VERSION = 'v23';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -158,6 +163,7 @@ export const CSV_COLUMNS = [
   'nGyroAgeMs', 'nAccAgeMs', 'nGravAgeMs', 'sensorSource', 'appState',
   'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
   'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
+  'mockMode',
 ];
 
 const num = (v) => {
@@ -339,6 +345,7 @@ class TelemetryService {
     appState = null,
     mockActive = null, mockLat = null, mockLon = null, mockAccuracy = null, mockBearing = null,
     anchorAgeS = null, headingOffsetDeg = null, anchorState = null, // geoAnchor (лише лог)
+    mockMode = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -630,6 +637,7 @@ class TelemetryService {
       uBiasZ: numOrNull(uBiasZ),
       uGyroAgeMs: numOrNull(uGyroAgeMs),
       mockActive: typeof mockActive === 'boolean' ? mockActive : null,
+      mockMode: mockMode === 'fused' || mockMode === 'fusedGps' ? mockMode : null,
       mockLat: numOrNull(mockLat),
       mockLon: numOrNull(mockLon),
       mockAccuracy: numOrNull(mockAccuracy),

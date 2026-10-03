@@ -15,6 +15,7 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system/legacy';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
@@ -37,6 +38,10 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 
 // Прив'язка DR до карти за GPS (TASK-018): окремий шар поверх ядра, heading/posX/posY не змінює
 const geoAnchor = createGeoAnchor();
+
+// Режим підміни (TASK-019): "fused" — лише fused (справжній GPS лишається видимим) або "fusedGps"
+const WAZE_MODES = { fused: 'Fused', fusedGps: 'Fused+GPS' };
+const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
 const formatHHMMSS = (ms) => {
@@ -59,6 +64,8 @@ export default function App() {
   const isRecordingRef = useRef(false);
   const [wazeActive, setWazeActive] = useState(false);
   const [wazeError, setWazeError] = useState(null);
+  const [wazeMode, setWazeMode] = useState('fused');
+  const wazeModeActiveRef = useRef(null); // режим, у якому подача зараз увімкнена (null — вимкнена)
   const [anchorView, setAnchorView] = useState({ state: 'waiting' });
   const wazeActiveRef = useRef(false);
   const wazeTimerRef = useRef(null);
@@ -139,6 +146,30 @@ export default function App() {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
+  // Збережений вибір режиму підміни (локальний файл застосунку)
+  useEffect(() => {
+    (async () => {
+      try {
+        const info = await FileSystem.getInfoAsync(SETTINGS_FILE);
+        if (!info.exists) return;
+        const saved = JSON.parse(await FileSystem.readAsStringAsync(SETTINGS_FILE));
+        if (saved && WAZE_MODES[saved.wazeMode]) setWazeMode(saved.wazeMode);
+      } catch (e) {
+        console.warn('Налаштування не прочитано:', e);
+      }
+    })();
+  }, []);
+
+  const chooseWazeMode = async (mode) => {
+    if (wazeActive || !WAZE_MODES[mode]) return; // змінювати режим можна лише коли WAZE вимкнено
+    setWazeMode(mode);
+    try {
+      await FileSystem.writeAsStringAsync(SETTINGS_FILE, JSON.stringify({ wazeMode: mode }));
+    } catch (e) {
+      console.warn('Налаштування не збережено:', e);
+    }
+  };
+
   // Одна точка ядра. recordPoint синхронний — тики не накладаються.
   // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
   // Використовує лише ref-и і модулі, тож безпечно викликається із будь-яких ефектів.
@@ -186,6 +217,7 @@ export default function App() {
         uGyroAgeMs: nativeOk ? d.uGyroAgeMs : null,
         appState: AppState.currentState,
         mockActive: wazeActiveRef.current,
+        mockMode: wazeModeActiveRef.current,
         mockLat: anchorPos.lat,
         mockLon: anchorPos.lon,
         mockAccuracy: anchorPos.accuracy,
@@ -487,6 +519,7 @@ export default function App() {
     clearBgInterval(wazeTimerRef.current);
     wazeTimerRef.current = null;
     wazeActiveRef.current = false;
+    wazeModeActiveRef.current = null;
     setWazeActive(false);
     if (MockLocationModule) {
       try {
@@ -521,13 +554,14 @@ export default function App() {
     }
     if (!isRecording || !MockLocationModule) return;
     try {
-      await MockLocationModule.start();
+      await MockLocationModule.start(wazeMode);
     } catch (e) {
       setWazeError(e && e.code === 'NOT_MOCK_APP' ? 'NOT_MOCK_APP' : `ПОМИЛКА: ${e && e.message}`);
       return;
     }
     setWazeError(null);
     wazeActiveRef.current = true;
+    wazeModeActiveRef.current = wazeMode;
     setWazeActive(true);
     wazeTimerRef.current = setBgInterval(() => {
       feedWaze();
@@ -535,6 +569,11 @@ export default function App() {
   };
 
   const wazeStatusText = () => {
+    const mode = `[${WAZE_MODES[wazeMode]}] `;
+    return mode + wazeStatusCore();
+  };
+
+  const wazeStatusCore = () => {
     if (wazeError === 'NOT_MOCK_APP') {
       return 'Waze: оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника';
     }
@@ -745,6 +784,23 @@ export default function App() {
       </View>
 
       <View style={{ marginBottom: 12 }}>
+        <View style={{ flexDirection: 'row', justifyContent: 'center', marginBottom: 8 }}>
+          {Object.keys(WAZE_MODES).map((m) => (
+            <TouchableOpacity
+              key={m}
+              onPress={() => chooseWazeMode(m)}
+              disabled={wazeActive}
+              style={[
+                styles.badge,
+                wazeMode === m ? styles.badgeActive : styles.badgeInactive,
+                { marginHorizontal: 5 },
+                wazeActive && { opacity: 0.5 },
+              ]}
+            >
+              <Text style={styles.badgeText}>{WAZE_MODES[m]}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
         <TouchableOpacity
           style={[styles.syncBtn, { flex: 0, width: '100%' }, wazeActive && { backgroundColor: '#0284c7' }]}
           onPress={toggleWaze}

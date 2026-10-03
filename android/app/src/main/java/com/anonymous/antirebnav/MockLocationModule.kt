@@ -19,7 +19,8 @@ import com.google.android.gms.location.LocationServices
  * Подача DR-позиції як системної геолокації (mock location provider) — для Waze/Google Maps (TASK-018).
  *
  * Потрібно обрати застосунок у «Параметри розробника → Застосунок для фіктивних місцезнаходжень».
- * Підміняємо GPS_PROVIDER і fused (навігатори часто читають саме fused).
+ * Два режими (TASK-019): "fused" — підміняється лише fused (GPS_PROVIDER лишається справжнім і видимим
+ * для застосунку); "fusedGps" — fused і GPS_PROVIDER (TASK-018). Навігатори часто читають fused.
  * NETWORK_PROVIDER не чіпаємо — мережеві колонки лишаються справжніми.
  */
 class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
@@ -33,6 +34,7 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
     private var fusedClient: FusedLocationProviderClient? = null
     private var active = false
     private var fusedMockOn = false
+    private var gpsMockOn = false
 
     override fun getName(): String {
         return "MockLocationModule"
@@ -59,39 +61,57 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
         lm.setTestProviderEnabled(GPS, true)
     }
 
-    /** Resolve: { gps, fused }. Reject з кодом NOT_MOCK_APP, якщо застосунок не обрано для фіктивних місцезнаходжень. */
+    private fun notMockAppMessage(): String {
+        return "Оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника"
+    }
+
+    /**
+     * mode: "fused" (лише fused; GPS_PROVIDER не чіпаємо) або "fusedGps" (fused + GPS_PROVIDER).
+     * Resolve: { gps, fused, mode }. Reject з кодом NOT_MOCK_APP, якщо застосунок не обрано
+     * для фіктивних місцезнаходжень.
+     */
     @ReactMethod
-    fun start(promise: Promise) {
+    fun start(mode: String, promise: Promise) {
+        val withGps = mode == "fusedGps"
         try {
             val ctx = reactApplicationContext
             val lm = ctx.getSystemService(Context.LOCATION_SERVICE) as LocationManager
             locationManager = lm
-            addGpsTestProvider(lm)
-
-            var fusedRequested = false
-            try {
-                val client = LocationServices.getFusedLocationProviderClient(ctx)
-                client.setMockMode(true)
-                    .addOnFailureListener { e -> Log.e(TAG, "fused setMockMode(true) не вдалося: ", e) }
-                fusedClient = client
-                fusedMockOn = true
-                fusedRequested = true
-            } catch (e: Exception) {
-                Log.e(TAG, "Fused mock недоступний: ", e)
+            if (withGps) {
+                addGpsTestProvider(lm)
+                gpsMockOn = true
             }
 
-            active = true
-            promise.resolve(Arguments.createMap().apply {
-                putBoolean("gps", true)
-                putBoolean("fused", fusedRequested)
-            })
+            val client = LocationServices.getFusedLocationProviderClient(ctx)
+            fusedClient = client
+            client.setMockMode(true)
+                .addOnSuccessListener {
+                    fusedMockOn = true
+                    active = true
+                    promise.resolve(Arguments.createMap().apply {
+                        putBoolean("gps", gpsMockOn)
+                        putBoolean("fused", true)
+                        putString("mode", if (withGps) "fusedGps" else "fused")
+                    })
+                }
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "fused setMockMode(true) не вдалося: ", e)
+                    val notMockApp = e is SecurityException ||
+                        (e.message ?: "").contains("mock", ignoreCase = true)
+                    stopInternal()
+                    if (notMockApp) {
+                        promise.reject("NOT_MOCK_APP", notMockAppMessage())
+                    } else {
+                        promise.reject("MOCK_START_ERROR", e.message)
+                    }
+                }
         } catch (e: SecurityException) {
             Log.e(TAG, "Застосунок не обрано для фіктивних місцезнаходжень: ", e)
-            active = false
-            promise.reject("NOT_MOCK_APP", "Оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника")
+            stopInternal()
+            promise.reject("NOT_MOCK_APP", notMockAppMessage())
         } catch (e: Exception) {
             Log.e(TAG, "Помилка запуску mock: ", e)
-            active = false
+            stopInternal()
             promise.reject("MOCK_START_ERROR", e.message)
         }
     }
@@ -141,13 +161,15 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
             return
         }
         try {
-            try {
-                lm.setTestProviderLocation(GPS, buildLocation(GPS, lat, lon, accuracy, speedMps, bearingDeg, altitude, hasAltitude))
-            } catch (e: IllegalArgumentException) {
-                // Android іноді скидає тестовий провайдер — реєструємо заново і повторюємо
-                Log.w(TAG, "Тестовий провайдер скинуто, реєструємо заново")
-                addGpsTestProvider(lm)
-                lm.setTestProviderLocation(GPS, buildLocation(GPS, lat, lon, accuracy, speedMps, bearingDeg, altitude, hasAltitude))
+            if (gpsMockOn) {
+                try {
+                    lm.setTestProviderLocation(GPS, buildLocation(GPS, lat, lon, accuracy, speedMps, bearingDeg, altitude, hasAltitude))
+                } catch (e: IllegalArgumentException) {
+                    // Android іноді скидає тестовий провайдер — реєструємо заново і повторюємо
+                    Log.w(TAG, "Тестовий провайдер скинуто, реєструємо заново")
+                    addGpsTestProvider(lm)
+                    lm.setTestProviderLocation(GPS, buildLocation(GPS, lat, lon, accuracy, speedMps, bearingDeg, altitude, hasAltitude))
+                }
             }
             if (fusedMockOn) {
                 fusedClient
@@ -157,7 +179,7 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
             promise.resolve(true)
         } catch (e: SecurityException) {
             active = false
-            promise.reject("NOT_MOCK_APP", "Оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника")
+            promise.reject("NOT_MOCK_APP", notMockAppMessage())
         } catch (e: Exception) {
             Log.e(TAG, "Помилка push: ", e)
             promise.reject("MOCK_PUSH_ERROR", e.message)
@@ -170,23 +192,27 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
         promise.resolve(true)
     }
 
+    // Знімаємо лише те, що було ввімкнено (режим "fused" не чіпає GPS_PROVIDER)
     private fun stopInternal() {
         val lm = locationManager
-        try {
-            lm?.setTestProviderEnabled(GPS, false)
-        } catch (e: Exception) {
-            Log.w(TAG, "setTestProviderEnabled(false): ", e)
-        }
-        try {
-            lm?.removeTestProvider(GPS)
-        } catch (e: Exception) {
-            Log.w(TAG, "removeTestProvider: ", e)
+        if (gpsMockOn) {
+            try {
+                lm?.setTestProviderEnabled(GPS, false)
+            } catch (e: Exception) {
+                Log.w(TAG, "setTestProviderEnabled(false): ", e)
+            }
+            try {
+                lm?.removeTestProvider(GPS)
+            } catch (e: Exception) {
+                Log.w(TAG, "removeTestProvider: ", e)
+            }
         }
         try {
             if (fusedMockOn) fusedClient?.setMockMode(false)
         } catch (e: Exception) {
             Log.w(TAG, "fused setMockMode(false): ", e)
         }
+        gpsMockOn = false
         fusedMockOn = false
         fusedClient = null
         active = false

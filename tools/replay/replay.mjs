@@ -18,6 +18,8 @@
  * від GPS у моменти GPS-фіксів (до переприв'язки) окремо для кожного anchorSource. --gps-off-after=<с від початку>: після цього часу
  * geoAnchor не отримує GPS-фіксів (режим «без GPS»); істинний GPS у даних лишається для оцінки.
  * --gps-off-after=0 відтворює чисто мережевий режим.
+ * Якщо в CSV є колонка rebSim і на рядку rebSim = true («Симуляція РЕБ»), GPS-фікси в geoAnchor
+ * на цьому рядку не подаються (відтворення збігається з живим станом); істинний GPS лишається для оцінки.
  * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
@@ -166,7 +168,8 @@ for (const line of lines.slice(1)) {
           errBySource[pre.source].push(mockErrM);
           if (gpsOffAfterS !== null && tRel >= gpsOffAfterS) errAfterOff.push({ t: tRel, err: mockErrM, state: pre.source });
         }
-        const gpsOff = gpsOffAfterS !== null && tRel >= gpsOffAfterS;
+        const rebRow = 'rebSim' in col && c[col.rebSim] === 'true';
+        const gpsOff = rebRow || (gpsOffAfterS !== null && tRel >= gpsOffAfterS);
         if (!gpsOff) {
           anchor.onGpsFix({
             tMs: e.timestamp, lat, lon,

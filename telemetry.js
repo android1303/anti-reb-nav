@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v24)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v25)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -107,9 +107,13 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  * Зміни v24 (TASK-021, лише формат лога; розрахунок без змін):
  * 24. Автоматична прив'язка DR за мережевою позицією (geoAnchor, пріоритет
  *     GPS -> мережа -> DR): колонки anchorSource, netFitN, netFitResidM.
+ *
+ * Зміни v25 (TASK-023, лише формат лога; розрахунок без змін):
+ * 25. Колонка rebSim (true/false) — увімкнено «Симуляцію РЕБ»: geoAnchor не
+ *     отримує GPS-фіксів, а справжні lat/lon/gpsAccuracy лишаються еталоном.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v24';
+export const CORE_VERSION = 'v25';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -168,6 +172,7 @@ export const CSV_COLUMNS = [
   'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
   'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
   'mockMode', 'anchorSource', 'netFitN', 'netFitResidM',
+  'rebSim',
 ];
 
 const num = (v) => {
@@ -351,6 +356,7 @@ class TelemetryService {
     anchorAgeS = null, headingOffsetDeg = null, anchorState = null, // geoAnchor (лише лог)
     mockMode = null,
     anchorSource = null, netFitN = null, netFitResidM = null,
+    rebSim = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -642,6 +648,7 @@ class TelemetryService {
       uBiasZ: numOrNull(uBiasZ),
       uGyroAgeMs: numOrNull(uGyroAgeMs),
       mockActive: typeof mockActive === 'boolean' ? mockActive : null,
+      rebSim: typeof rebSim === 'boolean' ? rebSim : null,
       anchorSource: ['gps', 'network', 'dr_only', 'waiting'].includes(anchorSource) ? anchorSource : null,
       netFitN: numOrNull(netFitN),
       netFitResidM: numOrNull(netFitResidM),

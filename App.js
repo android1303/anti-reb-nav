@@ -17,6 +17,7 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
+import * as FileSystem from 'expo-file-system/legacy';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
@@ -41,7 +42,8 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-022';
+const LAST_TASK = 'TASK-023';
+const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
 
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
@@ -57,6 +59,9 @@ export default function App() {
   const [currentPressure, setCurrentPressure] = useState(0);
   const [gnssView, setGnssView] = useState({ hasFix: false, lat: null, lon: null, satUsed: null, satInView: null });
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
+  // «Симуляція РЕБ»: geoAnchor не отримує GPS-фіксів (лише мережа і DR); GPS лишається еталоном у лозі
+  const [rebSim, setRebSim] = useState(false);
+  const rebSimRef = useRef(false);
 
   const [bufferCount, setBufferCount] = useState(0);
   const [syncState, setSyncState] = useState(telemetry.getSyncState());
@@ -148,6 +153,34 @@ export default function App() {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
+  // Збережений стан перемикача «Симуляція РЕБ» (локальний файл застосунку)
+  useEffect(() => {
+    (async () => {
+      try {
+        const info = await FileSystem.getInfoAsync(SETTINGS_FILE);
+        if (!info.exists) return;
+        const saved = JSON.parse(await FileSystem.readAsStringAsync(SETTINGS_FILE));
+        if (saved && typeof saved.rebSim === 'boolean') {
+          rebSimRef.current = saved.rebSim;
+          setRebSim(saved.rebSim);
+        }
+      } catch (e) {
+        console.warn('Налаштування не прочитано:', e);
+      }
+    })();
+  }, []);
+
+  // Перемикати можна будь-коли; геoAnchor при цьому не скидається (далі працює за мережею/DR)
+  const toggleRebSim = async (value) => {
+    rebSimRef.current = value;
+    setRebSim(value);
+    try {
+      await FileSystem.writeAsStringAsync(SETTINGS_FILE, JSON.stringify({ rebSim: value }));
+    } catch (e) {
+      console.warn('Налаштування не збережено:', e);
+    }
+  };
+
   // Одна точка ядра. recordPoint синхронний — тики не накладаються.
   // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
   // Використовує лише ref-и і модулі, тож безпечно викликається із будь-яких ефектів.
@@ -195,6 +228,7 @@ export default function App() {
         uGyroAgeMs: nativeOk ? d.uGyroAgeMs : null,
         appState: AppState.currentState,
         mockActive: mockRunningRef.current,
+        rebSim: rebSimRef.current,
         mockMode: mockRunningRef.current ? 'fused' : null,
         mockLat: anchorPos.lat,
         mockLon: anchorPos.lon,
@@ -397,7 +431,10 @@ export default function App() {
             d.gpsMock = typeof e.isMock === 'boolean' ? e.isMock : null;
             d.gpsRxMs = Date.now();
             // Фікси з isMock = true (наша ж підміна) geoAnchor ігнорує і заморожує прив'язку
-            geoAnchor.onGpsFix({ tMs: d.gpsRxMs, lat: e.lat, lon: e.lon, accuracy: e.accuracy, mock: e.isMock });
+            // У режимі «Симуляція РЕБ» GPS-фікс до geoAnchor не йде (решта обробки — без змін)
+            if (!rebSimRef.current) {
+              geoAnchor.onGpsFix({ tMs: d.gpsRxMs, lat: e.lat, lon: e.lon, accuracy: e.accuracy, mock: e.isMock });
+            }
           }),
           gnssEmitter.addListener('gnssNetFix', (e) => {
             const d = latestData.current;
@@ -726,6 +763,12 @@ export default function App() {
         </View>
       </View>
 
+      {rebSim && (
+        <Text style={{ color: '#facc15', fontWeight: 'bold', fontSize: 12, textAlign: 'center', marginBottom: 10 }}>
+          СИМУЛЯЦІЯ РЕБ: GPS не використовується для прив'язки
+        </Text>
+      )}
+
       <View style={styles.grid}>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD)</Text>
@@ -783,6 +826,16 @@ export default function App() {
           value={isGpsEnabled}
           onValueChange={setIsGpsEnabled}
           trackColor={{ false: '#334155', true: '#0284c7' }}
+          thumbColor={'#fff'}
+        />
+      </View>
+
+      <View style={[styles.toggleRow, { marginTop: -10 }]}>
+        <Text style={styles.toggleLabel}>Симуляція РЕБ</Text>
+        <Switch
+          value={rebSim}
+          onValueChange={toggleRebSim}
+          trackColor={{ false: '#334155', true: '#ca8a04' }}
           thumbColor={'#fff'}
         />
       </View>

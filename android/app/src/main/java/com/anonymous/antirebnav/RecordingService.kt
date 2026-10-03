@@ -28,10 +28,26 @@ class RecordingService : Service() {
     private val WAKE_LOCK_TIMEOUT_MS = 6L * 60 * 60 * 1000 // страховка від «вічного» wake lock
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var foregroundStarted = false
+
+    companion object {
+        // Оновлення тексту сповіщення (TASK-024): intent з цим action і extra obdLost
+        const val ACTION_OBD_STATE = "com.anonymous.antirebnav.OBD_STATE"
+        const val EXTRA_OBD_LOST = "obdLost"
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_OBD_STATE) {
+            if (foregroundStarted) {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(NOTIFICATION_ID, buildNotification(intent.getBooleanExtra(EXTRA_OBD_LOST, false)))
+            } else {
+                stopSelf() // сервіс не в записі — оновлювати нічого
+            }
+            return START_NOT_STICKY
+        }
         val notification = buildNotification()
         try {
             if (Build.VERSION.SDK_INT >= 29) {
@@ -45,6 +61,8 @@ class RecordingService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        foregroundStarted = true
 
         if (wakeLock == null) {
             try {
@@ -78,7 +96,7 @@ class RecordingService : Service() {
         return type
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(obdLost: Boolean = false): Notification {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             val channel = NotificationChannel(CHANNEL_ID, "Запис", NotificationManager.IMPORTANCE_LOW)
@@ -103,7 +121,7 @@ class RecordingService : Service() {
         }
         builder
             .setContentTitle("Anti-REB Nav: йде запис")
-            .setContentText("Датчики, OBD і GNSS працюють у фоні")
+            .setContentText(if (obdLost) "OBD втрачено" else "Датчики, OBD і GNSS працюють у фоні")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
         if (contentIntent != null) builder.setContentIntent(contentIntent)

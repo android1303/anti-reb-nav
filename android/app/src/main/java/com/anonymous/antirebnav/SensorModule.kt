@@ -262,6 +262,22 @@ class SensorModule(reactContext: ReactApplicationContext) :
         }
     }
 
+    /** Текст сповіщення RecordingService: «OBD втрачено» замість звичайного (TASK-024). */
+    @ReactMethod
+    fun setObdLost(lost: Boolean, promise: Promise) {
+        try {
+            val ctx = reactApplicationContext
+            val intent = Intent(ctx, RecordingService::class.java)
+            intent.action = RecordingService.ACTION_OBD_STATE
+            intent.putExtra(RecordingService.EXTRA_OBD_LOST, lost)
+            ctx.startService(intent)
+            promise.resolve(true)
+        } catch (e: Exception) {
+            Log.w(TAG, "Не вдалося оновити сповіщення: ", e)
+            promise.resolve(false)
+        }
+    }
+
     override fun invalidate() {
         stopInternal()
         super.invalidate()

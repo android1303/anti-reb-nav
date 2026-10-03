@@ -25,7 +25,7 @@
  *   ga.onGpsFix({ tMs, lat, lon, accuracy, mock });                // кожен новий GPS-фікс
  *   ga.onNetFix({ tMs, lat, lon, accuracy, ageMs, mock });         // кожен новий мережевий фікс
  *   ga.getPosition(nowMs) -> { state, source, lat, lon, bearing, accuracy, anchorAgeS,
- *                              headingOffsetDeg, netFitN, netFitResidM }
+ *                              headingOffsetDeg, netFitN, netFitResidM, netFitPathM }
  *   ga.reset();                                                    // початок нової сесії
  * state — стан GPS-прив'язки (як у TASK-018): waiting | gps | dr_only;
  * source — джерело, що реально використано: waiting | gps | network | dr_only.
@@ -205,7 +205,7 @@ export function createGeoAnchor() {
   // --------------------------- Мережа ---------------------------
   const refitNetwork = () => {
     const prev = netFit;
-    netFit = { ready: false, n: netPairs.length, resid: null, theta: 0, tE: 0, tN: 0, t: prev ? prev.t : null, path: prev ? prev.path : 0 };
+    netFit = { ready: false, n: netPairs.length, span: 0, resid: null, theta: 0, tE: 0, tN: 0, t: prev ? prev.t : null, path: prev ? prev.path : 0 };
     if (netPairs.length < 2) return;
     let fit = fitRigid(netPairs);
     let kept = netPairs;
@@ -223,6 +223,7 @@ export function createGeoAnchor() {
     netFit.tE = fit.tE;
     netFit.tN = fit.tN;
     netFit.n = kept.length;
+    netFit.span = kept.length >= 2 ? kept[kept.length - 1].path - kept[0].path : 0; // лише для відображення
     netFit.resid = resid;
     netFit.ready =
       kept.length >= NET_READY_FIXES && kept[kept.length - 1].path - kept[0].path >= NET_READY_PATH_M;
@@ -292,7 +293,8 @@ export function createGeoAnchor() {
     const netFitN = netFit ? netFit.n : null;
     const netFitResidM = netFit ? netFit.resid : null;
     const empty = { lat: null, lon: null, bearing: null, accuracy: null, anchorAgeS: null };
-    const common = { state, netFitN, netFitResidM };
+    const netFitPathM = netFit ? netFit.span : null;
+    const common = { state, netFitN, netFitResidM, netFitPathM };
     if (last === null) {
       return { ...common, source: 'waiting', ...empty, headingOffsetDeg: thetaRad === null ? null : normDeg180(thetaRad / DEG) };
     }

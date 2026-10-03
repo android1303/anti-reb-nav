@@ -1,10 +1,12 @@
 package com.anonymous.antirebnav
 
+import android.app.AppOpsManager
 import android.content.Context
 import android.location.Criteria
 import android.location.Location
 import android.location.LocationManager
 import android.os.Build
+import android.os.Process
 import android.os.SystemClock
 import android.util.Log
 import com.facebook.react.bridge.Arguments
@@ -59,6 +61,24 @@ class MockLocationModule(reactContext: ReactApplicationContext) : ReactContextBa
             Criteria.ACCURACY_FINE
         )
         lm.setTestProviderEnabled(GPS, true)
+    }
+
+    /**
+     * Чи обрано застосунок у «Параметри розробника → Застосунок для фіктивних місцезнаходжень»
+     * (AppOps MOCK_LOCATION), без вмикання підміни. Resolve: true/false.
+     */
+    @ReactMethod
+    fun canMock(promise: Promise) {
+        try {
+            val ctx = reactApplicationContext
+            val appOps = ctx.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+            @Suppress("DEPRECATION")
+            val mode = appOps.checkOpNoThrow(AppOpsManager.OPSTR_MOCK_LOCATION, Process.myUid(), ctx.packageName)
+            promise.resolve(mode == AppOpsManager.MODE_ALLOWED)
+        } catch (e: Exception) {
+            Log.w(TAG, "canMock не вдалося визначити: ", e)
+            promise.reject("CAN_MOCK_ERROR", e.message)
+        }
     }
 
     private fun notMockAppMessage(): String {

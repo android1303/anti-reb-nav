@@ -42,7 +42,9 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-023';
+const LAST_TASK = 'TASK-024';
+const OBD_LOST_BANNER_MS = 5000; // OBD несвіжий довше — червона смуга і сповіщення «OBD втрачено»
+const WAZE_FIX_WAIT_MS = 30000; // жодного свіжого фіксу GPS чи мережі за цей час — «очікую GPS або мережу»
 const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
 
 const SYNC_ERROR_DISPLAY_MS = 4000;
@@ -56,6 +58,8 @@ const formatHHMMSS = (ms) => {
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
   const [obdStale, setObdStale] = useState(true);
+  const [obdLost, setObdLost] = useState(false); // під час запису OBD несвіжий > 5 с
+  const [fixFresh, setFixFresh] = useState(false); // є свіжий фікс GPS або мережі (≤ 30 с)
   const [currentPressure, setCurrentPressure] = useState(0);
   const [gnssView, setGnssView] = useState({ hasFix: false, lat: null, lon: null, satUsed: null, satInView: null });
   const [isGpsEnabled, setIsGpsEnabled] = useState(false);
@@ -152,6 +156,12 @@ export default function App() {
   useEffect(() => {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
+
+  // Текст сповіщення RecordingService: «OBD втрачено» замість звичайного, поки OBD несвіжий
+  useEffect(() => {
+    if (!SensorModule || !isRecording) return;
+    SensorModule.setObdLost(obdLost).catch(() => {});
+  }, [obdLost, isRecording]);
 
   // Збережений стан перемикача «Симуляція РЕБ» (локальний файл застосунку)
   useEffect(() => {
@@ -322,6 +332,8 @@ export default function App() {
       setObdStale(!last || Date.now() - last > OBD_STALE_MS);
       const g = latestData.current;
       const nowMs = Date.now();
+      setObdLost(isRecordingRef.current && (!last || nowMs - last > OBD_LOST_BANNER_MS));
+      setFixFresh(nowMs - Math.max(g.gpsRxMs, g.netRxMs) <= WAZE_FIX_WAIT_MS);
       setGnssView({
         hasFix: !!g.gpsRxMs && nowMs - g.gpsRxMs <= GPS_FIX_STALE_MS,
         lat: g.lat,
@@ -626,6 +638,15 @@ export default function App() {
       return;
     }
     if (!MockLocationModule) return;
+    // Дозвіл на підміну перевіряємо одразу, а не під РЕБ через 1–1.5 км після натискання
+    try {
+      if (!(await MockLocationModule.canMock())) {
+        setWazeError('NOT_MOCK_APP');
+        return;
+      }
+    } catch (e) {
+      console.warn('canMock:', e); // не вдалося визначити — не блокуємо, помилка проявиться при старті підміни
+    }
     // Мережеві фікси дає GnssModule (запускається перемикачем «Еталонний GPS»): без нього прив'язка неможлива
     if (!isGpsEnabled) setIsGpsEnabled(true);
     setWazeError(null);
@@ -642,7 +663,15 @@ export default function App() {
     }
     if (wazeError) return `Waze: ${wazeError}`;
     if (!wazeArmed) return 'Waze: вимкнено';
-    if (!mockRunning) return "Waze: очікую прив'язку (Waze на власній геолокації)";
+    if (!mockRunning) {
+      // Що саме бракує — в порядку перевірки
+      if (obdStale) return "Waze: немає OBD — прив'язка неможлива";
+      if (!fixFresh) return 'Waze: очікую GPS або мережу';
+      if (anchorView.source === 'waiting') {
+        return `Waze: збираю мережу — ${anchorView.netFitN ?? 0} фіксів, ${Math.round(anchorView.netFitPathM ?? 0)} з 1000 м`;
+      }
+      return "Waze: очікую прив'язку (Waze на власній геолокації)";
+    }
     if (anchorView.source === 'gps') return `Waze: GPS, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
     if (anchorView.source === 'network') return `Waze: мережа, ~${Math.round(anchorView.accuracy)} м`;
     return `Waze: лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
@@ -666,9 +695,23 @@ export default function App() {
           console.warn('RecordingService не запущено (запис піде без фонового сервісу):', e);
         }
       }
+      // Без еталонного GPS запис непридатний для аналізу — вмикаємо автоматично (вручну можна вимкнути)
+      if (!isGpsEnabled) setIsGpsEnabled(true);
       telemetry.startSession();
       setNav(telemetry.getNavState());
       setIsRecording(true);
+      // Запис стартує в будь-якому разі, але водій має знати, що без OBD DR і прив'язка не працюватимуть
+      const lastObd = latestData.current.lastObdUpdateTime;
+      if (!isBluetoothConnected || !lastObd || Date.now() - lastObd > OBD_STALE_MS) {
+        Alert.alert(
+          'OBD не підключено',
+          "OBD не підключено — швидкості не буде, позиція DR і прив'язка не працюватимуть",
+          [
+            { text: 'Підключити OBD', onPress: () => connectBluetooth() },
+            { text: 'Писати без OBD', style: 'cancel' },
+          ]
+        );
+      }
     } else {
       setIsRecording(false);
       await disarmWaze();
@@ -743,6 +786,11 @@ export default function App() {
 
   return (
     <View style={styles.container}>
+      {obdLost && (
+        <View style={{ backgroundColor: '#dc2626', borderRadius: 6, paddingVertical: 8, marginBottom: 8 }}>
+          <Text style={{ color: 'white', fontWeight: 'bold', textAlign: 'center', letterSpacing: 1 }}>OBD ВТРАЧЕНО</Text>
+        </View>
+      )}
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}

@@ -10,6 +10,8 @@ import {
   PermissionsAndroid,
   Alert,
   AppState,
+  ScrollView,
+  ToastAndroid,
   NativeModules,
   NativeEventEmitter,
 } from 'react-native';
@@ -552,7 +554,11 @@ export default function App() {
       setWazeError(null);
       return;
     }
-    if (!isRecording || !MockLocationModule) return;
+    if (!isRecording) {
+      ToastAndroid.show("Спершу почни запис (і ввімкни Еталонний GPS для прив'язки)", ToastAndroid.LONG);
+      return;
+    }
+    if (!MockLocationModule) return;
     try {
       await MockLocationModule.start(wazeMode);
     } catch (e) {
@@ -679,6 +685,11 @@ export default function App() {
 
   return (
     <View style={styles.container}>
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
+      >
       <View style={styles.header}>
         <Text style={styles.headerTitle}>ANTI-REB NAV</Text>
         <View style={styles.statusIcons}>
@@ -802,25 +813,33 @@ export default function App() {
           ))}
         </View>
         <TouchableOpacity
-          style={[styles.syncBtn, { flex: 0, width: '100%' }, wazeActive && { backgroundColor: '#0284c7' }]}
+          style={[
+            styles.syncBtn,
+            { flex: 0, width: '100%' },
+            wazeActive && { backgroundColor: '#0284c7' },
+            !isRecording && !wazeActive && { opacity: 0.45 },
+          ]}
           onPress={toggleWaze}
-          disabled={!isRecording && !wazeActive}
         >
           <Text style={styles.syncBtnText}>{wazeActive ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
         </TouchableOpacity>
         <Text style={{ color: '#94a3b8', fontSize: 11, textAlign: 'center', marginTop: 6 }}>{wazeStatusText()}</Text>
       </View>
 
-      <TouchableOpacity
-        style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]}
-        onPress={toggleRecording}
-      >
-        <Text style={styles.recordBtnText}>{isRecording ? 'ЗУПИНИТИ ЗАПИС' : 'ЗАПИС ЛОГУ'}</Text>
-      </TouchableOpacity>
-
-      <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 15, marginBottom: 10 }}>
+      <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 5, marginBottom: 10 }}>
         Білд: {obdScanner.getVersion()} · ядро {CORE_VERSION}
       </Text>
+      </ScrollView>
+
+      {/* Кнопка запису закріплена внизу, поза зоною прокрутки */}
+      <View style={styles.bottomBar}>
+        <TouchableOpacity
+          style={[styles.recordBtn, isRecording ? styles.recordBtnActive : styles.recordBtnInactive]}
+          onPress={toggleRecording}
+        >
+          <Text style={styles.recordBtnText}>{isRecording ? 'ЗУПИНИТИ ЗАПИС' : 'ЗАПИС ЛОГУ'}</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }
@@ -831,6 +850,18 @@ const styles = StyleSheet.create({
     backgroundColor: '#0a0f1c',
     paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight + 10 : 40,
     paddingHorizontal: 15,
+  },
+  scroll: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingBottom: 12,
+  },
+  // Знизу — запас під системну панель навігації (edge-to-edge: застосунок малюється під нею)
+  bottomBar: {
+    paddingTop: 8,
+    paddingBottom: Platform.OS === 'android' ? 48 : 20,
+    backgroundColor: '#0a0f1c',
   },
   header: {
     flexDirection: 'row',

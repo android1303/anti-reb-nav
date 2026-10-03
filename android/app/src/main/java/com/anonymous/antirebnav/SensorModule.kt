@@ -49,6 +49,9 @@ class SensorModule(reactContext: ReactApplicationContext) :
     private var accTs = 0L
     private var grav: FloatArray? = null
     private var gravTs = 0L
+    // TYPE_GYROSCOPE_UNCALIBRATED: values[0..2] — сирий гіроскоп, values[3..5] — оцінка зсуву Android
+    private var ugyro: FloatArray? = null
+    private var ugyroTs = 0L
 
     private var tickCount = 0L
     private var tickStartUptime = 0L
@@ -83,6 +86,10 @@ class SensorModule(reactContext: ReactApplicationContext) :
             Sensor.TYPE_GRAVITY -> {
                 grav = event.values.copyOf(3)
                 gravTs = event.timestamp
+            }
+            Sensor.TYPE_GYROSCOPE_UNCALIBRATED -> {
+                ugyro = event.values.copyOf(6)
+                ugyroTs = event.timestamp
             }
         }
     }
@@ -124,6 +131,24 @@ class SensorModule(reactContext: ReactApplicationContext) :
         putAge(map, "gyroAgeMs", gyro, gyroTs, nowNs)
         putAge(map, "accAgeMs", acc, accTs, nowNs)
         putAge(map, "gravAgeMs", grav, gravTs, nowNs)
+        // Некалібрований гіроскоп і оцінка зсуву від Android — лише для логу (рад/с, як є)
+        val u = ugyro
+        if (u == null) {
+            map.putNull("uGyroX")
+            map.putNull("uGyroY")
+            map.putNull("uGyroZ")
+            map.putNull("uBiasX")
+            map.putNull("uBiasY")
+            map.putNull("uBiasZ")
+        } else {
+            map.putDouble("uGyroX", u[0].toDouble())
+            map.putDouble("uGyroY", u[1].toDouble())
+            map.putDouble("uGyroZ", u[2].toDouble())
+            map.putDouble("uBiasX", u[3].toDouble())
+            map.putDouble("uBiasY", u[4].toDouble())
+            map.putDouble("uBiasZ", u[5].toDouble())
+        }
+        if (u == null) map.putNull("uGyroAgeMs") else map.putDouble("uGyroAgeMs", (nowNs - ugyroTs) / 1_000_000.0)
         try {
             reactApplicationContext
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
@@ -157,14 +182,17 @@ class SensorModule(reactContext: ReactApplicationContext) :
             gyro = null
             acc = null
             grav = null
+            ugyro = null
 
             val sGyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
             val sAcc = sm.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
             val sGrav = sm.getDefaultSensor(Sensor.TYPE_GRAVITY)
+            val sUGyro = sm.getDefaultSensor(Sensor.TYPE_GYROSCOPE_UNCALIBRATED)
             // Датчика немає — поля null, без падіння
             if (sGyro != null) sm.registerListener(this, sGyro, SAMPLING_US, h)
             if (sAcc != null) sm.registerListener(this, sAcc, SAMPLING_US, h)
             if (sGrav != null) sm.registerListener(this, sGrav, SAMPLING_US, h)
+            if (sUGyro != null) sm.registerListener(this, sUGyro, SAMPLING_US, h)
 
             running = true
             tickCount = 1
@@ -175,6 +203,7 @@ class SensorModule(reactContext: ReactApplicationContext) :
                 putBoolean("gyro", sGyro != null)
                 putBoolean("acc", sAcc != null)
                 putBoolean("grav", sGrav != null)
+                putBoolean("ugyro", sUGyro != null)
                 putBoolean("tick", true)
             })
         } catch (e: Exception) {

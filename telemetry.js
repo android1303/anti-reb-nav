@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v20)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v21)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -86,9 +86,15 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  *     (+ вік кожного датчика) і appState.
  * 20. flush логу йде через bgScheduler (нативний такт), а не лише через
  *     setInterval, який у фоні призупиняється.
+ *
+ * Зміни v21 (TASK-017, лише формат лога; розрахунок без змін):
+ * 21. Паралельний запис некаліброваного гіроскопа Android
+ *     (TYPE_GYROSCOPE_UNCALIBRATED): uGyroX/Y/Z і оцінка зсуву від системи
+ *     uBiasX/Y/Z (рад/с, як є), uGyroAgeMs. Ядро їх НЕ використовує — для
+ *     відтворення обробки зсуву без системної калібровки.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v20';
+export const CORE_VERSION = 'v21';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -144,6 +150,7 @@ export const CSV_COLUMNS = [
   'fusedLat', 'fusedLon', 'fusedAccuracy', 'fusedFixAgeMs',
   'nGyroX', 'nGyroY', 'nGyroZ', 'nAccX', 'nAccY', 'nAccZ', 'nGravX', 'nGravY', 'nGravZ',
   'nGyroAgeMs', 'nAccAgeMs', 'nGravAgeMs', 'sensorSource', 'appState',
+  'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
 ];
 
 const num = (v) => {
@@ -320,6 +327,8 @@ class TelemetryService {
     nAccX = null, nAccY = null, nAccZ = null,
     nGravX = null, nGravY = null, nGravZ = null,
     nGyroAgeMs = null, nAccAgeMs = null, nGravAgeMs = null,
+    uGyroX = null, uGyroY = null, uGyroZ = null, // некалібрований гіроскоп (лише лог)
+    uBiasX = null, uBiasY = null, uBiasZ = null, uGyroAgeMs = null,
     appState = null,
     pressure = 0,
     lat = null,
@@ -604,6 +613,13 @@ class TelemetryService {
       nAccAgeMs: numOrNull(nAccAgeMs),
       nGravAgeMs: numOrNull(nGravAgeMs),
       sensorSource,
+      uGyroX: numOrNull(uGyroX),
+      uGyroY: numOrNull(uGyroY),
+      uGyroZ: numOrNull(uGyroZ),
+      uBiasX: numOrNull(uBiasX),
+      uBiasY: numOrNull(uBiasY),
+      uBiasZ: numOrNull(uBiasZ),
+      uGyroAgeMs: numOrNull(uGyroAgeMs),
       appState: typeof appState === 'string' && appState ? appState : null,
     };
 

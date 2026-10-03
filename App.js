@@ -88,6 +88,8 @@ export default function App() {
     nAccX: null, nAccY: null, nAccZ: null,
     nGravX: null, nGravY: null, nGravZ: null,
     nGyroAgeMs: null, nAccAgeMs: null, nGravAgeMs: null,
+    uGyroX: null, uGyroY: null, uGyroZ: null,
+    uBiasX: null, uBiasY: null, uBiasZ: null, uGyroAgeMs: null,
     gyroX: 0,
     gyroY: 0,
     gyroZ: 0,
@@ -164,6 +166,13 @@ export default function App() {
         nGyroAgeMs: nativeOk ? d.nGyroAgeMs : null,
         nAccAgeMs: nativeOk ? d.nAccAgeMs : null,
         nGravAgeMs: nativeOk ? d.nGravAgeMs : null,
+        uGyroX: nativeOk ? d.uGyroX : null,
+        uGyroY: nativeOk ? d.uGyroY : null,
+        uGyroZ: nativeOk ? d.uGyroZ : null,
+        uBiasX: nativeOk ? d.uBiasX : null,
+        uBiasY: nativeOk ? d.uBiasY : null,
+        uBiasZ: nativeOk ? d.uBiasZ : null,
+        uGyroAgeMs: nativeOk ? d.uGyroAgeMs : null,
         appState: AppState.currentState,
         pressure: d.pressure,
         lat: d.lat,
@@ -203,6 +212,8 @@ export default function App() {
       d.nAccX = e.accX; d.nAccY = e.accY; d.nAccZ = e.accZ;
       d.nGravX = e.gravX; d.nGravY = e.gravY; d.nGravZ = e.gravZ;
       d.nGyroAgeMs = e.gyroAgeMs; d.nAccAgeMs = e.accAgeMs; d.nGravAgeMs = e.gravAgeMs;
+      d.uGyroX = e.uGyroX; d.uGyroY = e.uGyroY; d.uGyroZ = e.uGyroZ;
+      d.uBiasX = e.uBiasX; d.uBiasY = e.uBiasY; d.uBiasZ = e.uBiasZ; d.uGyroAgeMs = e.uGyroAgeMs;
       bgTick(now);
       if (isRecordingRef.current) runCoreTick(now);
     });

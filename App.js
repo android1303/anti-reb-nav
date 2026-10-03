@@ -17,7 +17,6 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Sharing from 'expo-sharing';
-import * as FileSystem from 'expo-file-system/legacy';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
@@ -41,9 +40,9 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 // Прив'язка DR до карти за GPS (TASK-018): окремий шар поверх ядра, heading/posX/posY не змінює
 const geoAnchor = createGeoAnchor();
 
-// Режим підміни (TASK-019): "fused" — лише fused (справжній GPS лишається видимим) або "fusedGps"
-const WAZE_MODES = { fused: 'Fused', fusedGps: 'Fused+GPS' };
-const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
+// Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
+const LAST_TASK = 'TASK-022';
+
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
 const formatHHMMSS = (ms) => {
@@ -64,12 +63,13 @@ export default function App() {
   const [syncError, setSyncError] = useState(null);
   const syncErrorTimer = useRef(null);
   const isRecordingRef = useRef(false);
-  const [wazeActive, setWazeActive] = useState(false);
+  const [wazeArmed, setWazeArmed] = useState(false); // WAZE «озброєно»: подача вмикається, щойно є позиція
+  const [mockRunning, setMockRunning] = useState(false); // нативна підміна реально активна
   const [wazeError, setWazeError] = useState(null);
-  const [wazeMode, setWazeMode] = useState('fused');
-  const wazeModeActiveRef = useRef(null); // режим, у якому подача зараз увімкнена (null — вимкнена)
   const [anchorView, setAnchorView] = useState({ state: 'waiting' });
-  const wazeActiveRef = useRef(false);
+  const wazeArmedRef = useRef(false);
+  const mockRunningRef = useRef(false);
+  const wazeBusyRef = useRef(false);
   const wazeTimerRef = useRef(null);
   const lastSpeedMpsRef = useRef(0);
   const [isExporting, setIsExporting] = useState(false);
@@ -148,30 +148,6 @@ export default function App() {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
 
-  // Збережений вибір режиму підміни (локальний файл застосунку)
-  useEffect(() => {
-    (async () => {
-      try {
-        const info = await FileSystem.getInfoAsync(SETTINGS_FILE);
-        if (!info.exists) return;
-        const saved = JSON.parse(await FileSystem.readAsStringAsync(SETTINGS_FILE));
-        if (saved && WAZE_MODES[saved.wazeMode]) setWazeMode(saved.wazeMode);
-      } catch (e) {
-        console.warn('Налаштування не прочитано:', e);
-      }
-    })();
-  }, []);
-
-  const chooseWazeMode = async (mode) => {
-    if (wazeActive || !WAZE_MODES[mode]) return; // змінювати режим можна лише коли WAZE вимкнено
-    setWazeMode(mode);
-    try {
-      await FileSystem.writeAsStringAsync(SETTINGS_FILE, JSON.stringify({ wazeMode: mode }));
-    } catch (e) {
-      console.warn('Налаштування не збережено:', e);
-    }
-  };
-
   // Одна точка ядра. recordPoint синхронний — тики не накладаються.
   // Швидкість НЕ обнуляється при втраті OBD: ядро саме вирішує за obdAgeMs.
   // Використовує лише ref-и і модулі, тож безпечно викликається із будь-яких ефектів.
@@ -218,8 +194,8 @@ export default function App() {
         uBiasZ: nativeOk ? d.uBiasZ : null,
         uGyroAgeMs: nativeOk ? d.uGyroAgeMs : null,
         appState: AppState.currentState,
-        mockActive: wazeActiveRef.current,
-        mockMode: wazeModeActiveRef.current,
+        mockActive: mockRunningRef.current,
+        mockMode: mockRunningRef.current ? 'fused' : null,
         mockLat: anchorPos.lat,
         mockLon: anchorPos.lon,
         mockAccuracy: anchorPos.accuracy,
@@ -431,7 +407,14 @@ export default function App() {
             d.netRxMs = Date.now();
             // Мережеві фікси збираємо завжди: мережева прив'язка має бути готова одразу після втрати GPS.
             // Вік фіксу = час прийому − Location.time; застарілі (> 1.5 с) geoAnchor відкидає.
-            const netAgeMs = typeof e.timeMs === 'number' ? Math.max(0, d.netRxMs - e.timeMs) : 0;
+            // Вік за монотонним часом Android (ageAtEmitMs від GnssModule) + час обробки події;
+            // якщо поля немає — за Location.time (годинник телефона), як раніше
+            const netAgeMs =
+              typeof e.ageAtEmitMs === 'number'
+                ? Math.max(0, e.ageAtEmitMs) + Math.max(0, Date.now() - d.netRxMs)
+                : typeof e.timeMs === 'number'
+                ? Math.max(0, d.netRxMs - e.timeMs)
+                : 0;
             geoAnchor.onNetFix({
               tMs: d.netRxMs - netAgeMs,
               lat: e.lat,
@@ -530,13 +513,12 @@ export default function App() {
     }
   };
 
-  // Подача позиції DR у Waze як системної геолокації (mock location), 1 раз/с через bgScheduler
-  const stopWaze = async () => {
-    clearBgInterval(wazeTimerRef.current);
-    wazeTimerRef.current = null;
-    wazeActiveRef.current = false;
-    wazeModeActiveRef.current = null;
-    setWazeActive(false);
+  // Подача позиції DR у Waze (TASK-022): кнопка лише «озброює» подачу. Підміна (MockLocationModule)
+  // вмикається автоматично, коли geoAnchor має позицію, і вимикається, якщо позиції знову немає:
+  // поки прив'язки немає, Waze працює на власній геолокації (вишки/Wi-Fi), а не губить її.
+  const stopMock = async () => {
+    mockRunningRef.current = false;
+    setMockRunning(false);
     if (MockLocationModule) {
       try {
         await MockLocationModule.stop();
@@ -546,25 +528,59 @@ export default function App() {
     }
   };
 
+  const disarmWaze = async () => {
+    clearBgInterval(wazeTimerRef.current);
+    wazeTimerRef.current = null;
+    wazeArmedRef.current = false;
+    setWazeArmed(false);
+    if (mockRunningRef.current) await stopMock();
+  };
+
+  // NOT_MOCK_APP: повторного старту до наступного натискання WAZE не буде
+  const failWaze = async (code, message) => {
+    setWazeError(code === 'NOT_MOCK_APP' ? 'NOT_MOCK_APP' : `ПОМИЛКА: ${message}`);
+    await disarmWaze();
+  };
+
   const feedWaze = async () => {
-    const pos = geoAnchor.getPosition(Date.now());
-    if (pos.source === 'waiting') return; // прив'язки ще немає — Waze лишається на справжньому GPS
+    if (!wazeArmedRef.current || wazeBusyRef.current) return;
+    wazeBusyRef.current = true;
     try {
+      const pos = geoAnchor.getPosition(Date.now());
+      if (pos.source === 'waiting') {
+        if (mockRunningRef.current) await stopMock(); // позиції немає — повертаємо Waze власну геолокацію
+        return;
+      }
+      if (!mockRunningRef.current) {
+        try {
+          await MockLocationModule.start('fused');
+        } catch (e) {
+          await failWaze(e && e.code, e && e.message);
+          return;
+        }
+        if (!wazeArmedRef.current) {
+          await MockLocationModule.stop().catch(() => {}); // вимкнули під час старту
+          return;
+        }
+        mockRunningRef.current = true;
+        setMockRunning(true);
+      }
       // altitude не подаємо: GnssModule не віддає висоту
       await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
     } catch (e) {
       if (e && e.code === 'NOT_MOCK_APP') {
-        setWazeError('NOT_MOCK_APP');
-        stopWaze();
+        await failWaze('NOT_MOCK_APP');
       } else {
         console.warn('MockLocationModule.push:', e);
       }
+    } finally {
+      wazeBusyRef.current = false;
     }
   };
 
   const toggleWaze = async () => {
-    if (wazeActive) {
-      await stopWaze();
+    if (wazeArmed) {
+      await disarmWaze();
       setWazeError(null);
       return;
     }
@@ -572,36 +588,24 @@ export default function App() {
       ToastAndroid.show('Спершу почни запис', ToastAndroid.LONG);
       return;
     }
+    if (!MockLocationModule) return;
     // Мережеві фікси дає GnssModule (запускається перемикачем «Еталонний GPS»): без нього прив'язка неможлива
     if (!isGpsEnabled) setIsGpsEnabled(true);
-    if (!MockLocationModule) return;
-    try {
-      await MockLocationModule.start(wazeMode);
-    } catch (e) {
-      setWazeError(e && e.code === 'NOT_MOCK_APP' ? 'NOT_MOCK_APP' : `ПОМИЛКА: ${e && e.message}`);
-      return;
-    }
     setWazeError(null);
-    wazeActiveRef.current = true;
-    wazeModeActiveRef.current = wazeMode;
-    setWazeActive(true);
+    wazeArmedRef.current = true;
+    setWazeArmed(true);
     wazeTimerRef.current = setBgInterval(() => {
       feedWaze();
     }, 1000);
   };
 
   const wazeStatusText = () => {
-    const mode = `[${WAZE_MODES[wazeMode]}] `;
-    return mode + wazeStatusCore();
-  };
-
-  const wazeStatusCore = () => {
     if (wazeError === 'NOT_MOCK_APP') {
       return 'Waze: оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника';
     }
     if (wazeError) return `Waze: ${wazeError}`;
-    if (!wazeActive) return 'Waze: вимкнено';
-    if (anchorView.source === 'waiting') return "Waze: очікую мережу (або GPS) для прив'язки";
+    if (!wazeArmed) return 'Waze: вимкнено';
+    if (!mockRunning) return "Waze: очікую прив'язку (Waze на власній геолокації)";
     if (anchorView.source === 'gps') return `Waze: GPS, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
     if (anchorView.source === 'network') return `Waze: мережа, ~${Math.round(anchorView.accuracy)} м`;
     return `Waze: лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
@@ -630,7 +634,7 @@ export default function App() {
       setIsRecording(true);
     } else {
       setIsRecording(false);
-      await stopWaze();
+      await disarmWaze();
       await telemetry.stopSession();
       if (SensorModule) SensorModule.stopRecordingService().catch(() => {});
     }
@@ -812,39 +816,22 @@ export default function App() {
       </View>
 
       <View style={{ marginBottom: 12 }}>
-        <View style={{ flexDirection: 'row', justifyContent: 'center', marginBottom: 8 }}>
-          {Object.keys(WAZE_MODES).map((m) => (
-            <TouchableOpacity
-              key={m}
-              onPress={() => chooseWazeMode(m)}
-              disabled={wazeActive}
-              style={[
-                styles.badge,
-                wazeMode === m ? styles.badgeActive : styles.badgeInactive,
-                { marginHorizontal: 5 },
-                wazeActive && { opacity: 0.5 },
-              ]}
-            >
-              <Text style={styles.badgeText}>{WAZE_MODES[m]}</Text>
-            </TouchableOpacity>
-          ))}
-        </View>
         <TouchableOpacity
           style={[
             styles.syncBtn,
             { flex: 0, width: '100%' },
-            wazeActive && { backgroundColor: '#0284c7' },
-            !isRecording && !wazeActive && { opacity: 0.45 },
+            wazeArmed && { backgroundColor: '#0284c7' },
+            !isRecording && !wazeArmed && { opacity: 0.45 },
           ]}
           onPress={toggleWaze}
         >
-          <Text style={styles.syncBtnText}>{wazeActive ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
+          <Text style={styles.syncBtnText}>{wazeArmed ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
         </TouchableOpacity>
         <Text style={{ color: '#94a3b8', fontSize: 11, textAlign: 'center', marginTop: 6 }}>{wazeStatusText()}</Text>
       </View>
 
       <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 5, marginBottom: 10 }}>
-        Білд: {obdScanner.getVersion()} · ядро {CORE_VERSION}
+        Білд: {obdScanner.getVersion()} · {LAST_TASK} · ядро {CORE_VERSION}
       </Text>
       </ScrollView>
 

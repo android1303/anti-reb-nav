@@ -81,7 +81,7 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         }
     }
 
-    private fun fixToMap(loc: Location): WritableMap {
+    private fun fixToMap(loc: Location, withAge: Boolean = false): WritableMap {
         val map = Arguments.createMap()
         map.putDouble("lat", loc.latitude)
         map.putDouble("lon", loc.longitude)
@@ -89,6 +89,10 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         map.putDouble("timeMs", loc.time.toDouble())
         map.putDouble("elapsedMs", loc.elapsedRealtimeNanos / 1_000_000.0)
         map.putBoolean("isMock", isMock(loc))
+        // Вік фіксу в момент відправки події — за монотонним часом Android (для gnssGpsFix і gnssNetFix)
+        if (withAge) {
+            map.putDouble("ageAtEmitMs", (SystemClock.elapsedRealtimeNanos() - loc.elapsedRealtimeNanos) / 1_000_000.0)
+        }
         return map
     }
 
@@ -97,7 +101,7 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
     private fun makeListener(eventName: String): LocationListener {
         return object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                emit(eventName, fixToMap(location))
+                emit(eventName, fixToMap(location, true))
             }
 
             @Deprecated("Deprecated in Java")

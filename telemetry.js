@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v21)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v22)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -92,9 +92,15 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  *     (TYPE_GYROSCOPE_UNCALIBRATED): uGyroX/Y/Z і оцінка зсуву від системи
  *     uBiasX/Y/Z (рад/с, як є), uGyroAgeMs. Ядро їх НЕ використовує — для
  *     відтворення обробки зсуву без системної калібровки.
+ *
+ * Зміни v22 (TASK-018, лише формат лога; розрахунок без змін):
+ * 22. Прив'язка DR до карти за GPS (geoAnchor.js) і подача позиції у Waze через
+ *     mock location: колонки mockActive, mockLat, mockLon, mockAccuracy,
+ *     mockBearing, anchorAgeS, headingOffsetDeg, anchorState. Це окремий шар
+ *     поверх ядра: heading, posX, posY він не змінює.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v21';
+export const CORE_VERSION = 'v22';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -151,6 +157,7 @@ export const CSV_COLUMNS = [
   'nGyroX', 'nGyroY', 'nGyroZ', 'nAccX', 'nAccY', 'nAccZ', 'nGravX', 'nGravY', 'nGravZ',
   'nGyroAgeMs', 'nAccAgeMs', 'nGravAgeMs', 'sensorSource', 'appState',
   'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
+  'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
 ];
 
 const num = (v) => {
@@ -330,6 +337,8 @@ class TelemetryService {
     uGyroX = null, uGyroY = null, uGyroZ = null, // некалібрований гіроскоп (лише лог)
     uBiasX = null, uBiasY = null, uBiasZ = null, uGyroAgeMs = null,
     appState = null,
+    mockActive = null, mockLat = null, mockLon = null, mockAccuracy = null, mockBearing = null,
+    anchorAgeS = null, headingOffsetDeg = null, anchorState = null, // geoAnchor (лише лог)
     pressure = 0,
     lat = null,
     lon = null,
@@ -620,6 +629,14 @@ class TelemetryService {
       uBiasY: numOrNull(uBiasY),
       uBiasZ: numOrNull(uBiasZ),
       uGyroAgeMs: numOrNull(uGyroAgeMs),
+      mockActive: typeof mockActive === 'boolean' ? mockActive : null,
+      mockLat: numOrNull(mockLat),
+      mockLon: numOrNull(mockLon),
+      mockAccuracy: numOrNull(mockAccuracy),
+      mockBearing: numOrNull(mockBearing),
+      anchorAgeS: numOrNull(anchorAgeS),
+      headingOffsetDeg: numOrNull(headingOffsetDeg),
+      anchorState: typeof anchorState === 'string' && anchorState ? anchorState : null,
       appState: typeof appState === 'string' && appState ? appState : null,
     };
 

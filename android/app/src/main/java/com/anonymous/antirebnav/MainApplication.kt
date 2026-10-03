@@ -25,6 +25,7 @@ class MainApplication : Application(), ReactApplication {
           add(Elm327Package()) // <--- ОСЬ ТУТ МИ ЗАРЕЄСТРУВАЛИ НАШ НАТИВНИЙ МОДУЛЬ
           add(GnssPackage())
           add(SensorPackage())
+          add(MockLocationPackage())
         }
     )
   }

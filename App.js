@@ -18,7 +18,8 @@ import * as Sharing from 'expo-sharing';
 import { activateKeepAwakeAsync, deactivateKeepAwake } from 'expo-keep-awake';
 import { Barometer, Gyroscope, DeviceMotion } from 'expo-sensors';
 import obdScanner from './obdScanner';
-import { bgTick } from './bgScheduler';
+import { bgTick, setBgInterval, clearBgInterval } from './bgScheduler';
+import { createGeoAnchor } from './geoAnchor';
 import telemetry, { CORE_VERSION } from './telemetry';
 import { db } from './firebaseConfig';
 import { exportFirestoreToCSV } from './exportService';
@@ -30,9 +31,12 @@ const GNSS_STATUS_STALE_MS = 5000; // старіший стан супутник
 const EXPO_SENSOR_STALE_MS = 500; // expo-sensors мовчать (фон) — у лог пишемо null
 const NATIVE_TICK_STALE_MS = 200; // нативний такт зник — працює запасний setInterval
 
-const { GnssModule, SensorModule } = NativeModules;
+const { GnssModule, SensorModule, MockLocationModule } = NativeModules;
 const gnssEmitter = GnssModule ? new NativeEventEmitter(GnssModule) : null;
 const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null;
+
+// Прив'язка DR до карти за GPS (TASK-018): окремий шар поверх ядра, heading/posX/posY не змінює
+const geoAnchor = createGeoAnchor();
 const SYNC_ERROR_DISPLAY_MS = 4000;
 
 const formatHHMMSS = (ms) => {
@@ -53,6 +57,12 @@ export default function App() {
   const [syncError, setSyncError] = useState(null);
   const syncErrorTimer = useRef(null);
   const isRecordingRef = useRef(false);
+  const [wazeActive, setWazeActive] = useState(false);
+  const [wazeError, setWazeError] = useState(null);
+  const [anchorView, setAnchorView] = useState({ state: 'waiting' });
+  const wazeActiveRef = useRef(false);
+  const wazeTimerRef = useRef(null);
+  const lastSpeedMpsRef = useRef(0);
   const [isExporting, setIsExporting] = useState(false);
 
   const [isRecording, setIsRecording] = useState(false);
@@ -140,7 +150,8 @@ export default function App() {
       const expoMotionOk = !!d.expoMotionTs && now - d.expoMotionTs <= EXPO_SENSOR_STALE_MS;
       const nativeOk = !!d.lastNativeTickMs && now - d.lastNativeTickMs <= NATIVE_TICK_STALE_MS;
       const age = (rx) => (rx ? Math.max(0, now - rx) : null);
-      telemetry.recordPoint({
+      const anchorPos = geoAnchor.getPosition(now);
+      const entry = telemetry.recordPoint({
         speed: d.speed,
         obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
         // expo-sensors: паралельний запис (null, коли вони мовчать у фоні)
@@ -174,6 +185,14 @@ export default function App() {
         uBiasZ: nativeOk ? d.uBiasZ : null,
         uGyroAgeMs: nativeOk ? d.uGyroAgeMs : null,
         appState: AppState.currentState,
+        mockActive: wazeActiveRef.current,
+        mockLat: anchorPos.lat,
+        mockLon: anchorPos.lon,
+        mockAccuracy: anchorPos.accuracy,
+        mockBearing: anchorPos.bearing,
+        anchorAgeS: anchorPos.anchorAgeS,
+        headingOffsetDeg: anchorPos.headingOffsetDeg,
+        anchorState: anchorPos.state,
         pressure: d.pressure,
         lat: d.lat,
         lon: d.lon,
@@ -195,6 +214,10 @@ export default function App() {
         gnssConstellations: stFresh ? d.st.constellationsUsed : null,
         timestamp: now,
       });
+      if (entry) {
+        geoAnchor.onDrSample({ tMs: now, posX: entry.posX, posY: entry.posY, heading: entry.heading, speedKmh: entry.speedUsed });
+        lastSpeedMpsRef.current = entry.speedUsed / 3.6;
+      }
     } catch (err) {
       console.error('[Telemetry] Помилка запису точки (20 Гц):', err);
     }
@@ -247,6 +270,7 @@ export default function App() {
       setNav(telemetry.getNavState());
       setBufferCount(telemetry.getBufferSize());
       setSyncState(telemetry.getSyncState());
+      setAnchorView(geoAnchor.getPosition(Date.now()));
       const last = latestData.current.lastObdUpdateTime;
       setObdStale(!last || Date.now() - last > OBD_STALE_MS);
       const g = latestData.current;
@@ -359,6 +383,8 @@ export default function App() {
             d.gpsAccuracy = e.accuracy ?? null;
             d.gpsMock = typeof e.isMock === 'boolean' ? e.isMock : null;
             d.gpsRxMs = Date.now();
+            // Фікси з isMock = true (наша ж підміна) geoAnchor ігнорує і заморожує прив'язку
+            geoAnchor.onGpsFix({ tMs: d.gpsRxMs, lat: e.lat, lon: e.lon, accuracy: e.accuracy, mock: e.isMock });
           }),
           gnssEmitter.addListener('gnssNetFix', (e) => {
             const d = latestData.current;
@@ -456,8 +482,72 @@ export default function App() {
     }
   };
 
+  // Подача позиції DR у Waze як системної геолокації (mock location), 1 раз/с через bgScheduler
+  const stopWaze = async () => {
+    clearBgInterval(wazeTimerRef.current);
+    wazeTimerRef.current = null;
+    wazeActiveRef.current = false;
+    setWazeActive(false);
+    if (MockLocationModule) {
+      try {
+        await MockLocationModule.stop();
+      } catch (e) {
+        console.warn('MockLocationModule.stop:', e);
+      }
+    }
+  };
+
+  const feedWaze = async () => {
+    const pos = geoAnchor.getPosition(Date.now());
+    if (pos.state === 'waiting') return; // θ ще не готовий — Waze лишається на справжньому GPS
+    try {
+      // altitude не подаємо: GnssModule не віддає висоту
+      await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
+    } catch (e) {
+      if (e && e.code === 'NOT_MOCK_APP') {
+        setWazeError('NOT_MOCK_APP');
+        stopWaze();
+      } else {
+        console.warn('MockLocationModule.push:', e);
+      }
+    }
+  };
+
+  const toggleWaze = async () => {
+    if (wazeActive) {
+      await stopWaze();
+      setWazeError(null);
+      return;
+    }
+    if (!isRecording || !MockLocationModule) return;
+    try {
+      await MockLocationModule.start();
+    } catch (e) {
+      setWazeError(e && e.code === 'NOT_MOCK_APP' ? 'NOT_MOCK_APP' : `ПОМИЛКА: ${e && e.message}`);
+      return;
+    }
+    setWazeError(null);
+    wazeActiveRef.current = true;
+    setWazeActive(true);
+    wazeTimerRef.current = setBgInterval(() => {
+      feedWaze();
+    }, 1000);
+  };
+
+  const wazeStatusText = () => {
+    if (wazeError === 'NOT_MOCK_APP') {
+      return 'Waze: оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника';
+    }
+    if (wazeError) return `Waze: ${wazeError}`;
+    if (!wazeActive) return 'Waze: вимкнено';
+    if (anchorView.state === 'waiting') return 'Waze: очікую GPS для прив\'язки';
+    if (anchorView.state === 'gps') return `Waze: активно, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
+    return `Waze: без GPS, лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
+  };
+
   const toggleRecording = async () => {
     if (!isRecording) {
+      geoAnchor.reset(); // DR починається з нуля — стара прив'язка недійсна
       // Android 13+: без дозволу сповіщення foreground service все одно працює, але його не видно
       if (Platform.OS === 'android' && Platform.Version >= 33) {
         try {
@@ -478,6 +568,7 @@ export default function App() {
       setIsRecording(true);
     } else {
       setIsRecording(false);
+      await stopWaze();
       await telemetry.stopSession();
       if (SensorModule) SensorModule.stopRecordingService().catch(() => {});
     }
@@ -651,6 +742,17 @@ export default function App() {
         >
           <Text style={styles.syncBtnText}>{isExporting ? 'ФОРМУВАННЯ...' : 'ЕКСПОРТ (CSV)'}</Text>
         </TouchableOpacity>
+      </View>
+
+      <View style={{ marginBottom: 12 }}>
+        <TouchableOpacity
+          style={[styles.syncBtn, { flex: 0, width: '100%' }, wazeActive && { backgroundColor: '#0284c7' }]}
+          onPress={toggleWaze}
+          disabled={!isRecording && !wazeActive}
+        >
+          <Text style={styles.syncBtnText}>{wazeActive ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
+        </TouchableOpacity>
+        <Text style={{ color: '#94a3b8', fontSize: 11, textAlign: 'center', marginTop: 6 }}>{wazeStatusText()}</Text>
       </View>
 
       <TouchableOpacity

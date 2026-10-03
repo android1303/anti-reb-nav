@@ -2,7 +2,7 @@
 /**
  * Відтворення заїзду: подає сирі колонки CSV у справжнє ядро telemetry.js.
  *
- *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId] [--sensors=expo]
+ *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>]
  *
  * За замовчуванням ядро = ./telemetry.js, вихід = replay_out.csv.
  * Щоб перевірити інші константи — скопіюй telemetry.js у тимчасовий файл,
@@ -12,6 +12,10 @@
  * Входи датчиків (v20): якщо в CSV є нативні колонки nGyroX…nGravZ і вони не порожні —
  * ядро бере їх (sensorSource=native), інакше — старі gyroXRaw/accelX/gravX (expo).
  * --sensors=expo примусово ігнорує нативні колонки (порівняння еквівалентності).
+ * --anchor (TASK-018): додатково відтворює geoAnchor.js (прив'язка DR до карти за GPS) і пише
+ * mockLat/mockLon/anchorState у вихідний CSV; у кінці друкує відстань позиції для Waze від GPS
+ * у моменти GPS-фіксів (до переприв'язки). --gps-off-after=<с від початку>: після цього часу
+ * geoAnchor не отримує GPS-фіксів (режим «без GPS»); істинний GPS у даних лишається для оцінки.
  * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
@@ -23,9 +27,12 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const argv = process.argv.filter((a) => !a.startsWith('--'));
 const forceExpo = process.argv.includes('--sensors=expo');
+const useAnchor = process.argv.includes('--anchor');
+const gpsOffArg = process.argv.find((a) => a.startsWith('--gps-off-after='));
+const gpsOffAfterS = gpsOffArg ? Number(gpsOffArg.split('=')[1]) : null;
 const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js', sessionId] = argv;
 if (!csvPath) {
-  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId] [--sensors=expo]');
+  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>]');
   process.exit(1);
 }
 
@@ -60,6 +67,18 @@ const core = await import(pathToFileURL(tmp).href);
 unlinkSync(tmp);
 const telemetry = core.telemetry || core.default;
 
+let geoAnchorMod = null;
+if (useAnchor) {
+  const ga = await build({
+    entryPoints: [path.resolve(root, 'geoAnchor.js')],
+    bundle: true, format: 'esm', platform: 'node', write: false, logLevel: 'error',
+  });
+  const gaTmp = path.join(os.tmpdir(), `antireb_geoanchor_${Date.now()}.mjs`);
+  writeFileSync(gaTmp, ga.outputFiles[0].text);
+  geoAnchorMod = await import(pathToFileURL(gaTmp).href);
+  unlinkSync(gaTmp);
+}
+
 // Простий парсер CSV (значення без ком; лапки знімаються)
 const lines = readFileSync(csvPath, 'utf8').replace(/\r/g, '').trim().split('\n');
 const header = lines[0].split(',');
@@ -90,7 +109,18 @@ telemetry.startSession();
 const outCols = ['timestamp', 'currentState', 'speedUsed', 'speedExtrapolated', 'gapS', 'yawRateClean',
   'gyroBias', 'zuptApplied', 'heading', 'posX', 'posY', 'lat', 'lon',
   'forwardAxis', 'forwardSign', 'isReversing', 'sensorSource'];
+if (useAnchor) outCols.push('mockLat', 'mockLon', 'mockBearing', 'anchorState', 'mockErrM');
 const out = [outCols.join(',')];
+const anchor = useAnchor ? geoAnchorMod.createGeoAnchor() : null;
+let t0 = null;
+let prevLat = null, prevLon = null;
+const errGps = [];
+const errAfterOff = [];
+const mDist = (la1, lo1, la2, lo2) => {
+  const k = 111320;
+  return Math.hypot((lo2 - lo1) * k * Math.cos(la1 * Math.PI / 180), (la2 - la1) * k);
+};
+const median = (a) => { const x = [...a].sort((p, q) => p - q); return x.length ? x[Math.floor(x.length / 2)] : NaN; };
 for (const line of lines.slice(1)) {
   const c = line.split(',');
   if (sessionId && c[col.sessionId] !== sessionId) continue;
@@ -111,10 +141,49 @@ for (const line of lines.slice(1)) {
     lat: Number.isFinite(lat) ? lat : null, lon: Number.isFinite(lon) ? lon : null,
     timestamp: num(c, 'timestamp'),
   });
-  if (e) out.push(outCols.map((k) => (e[k] === null || e[k] === undefined ? '' : e[k])).join(','));
+  if (e) {
+    if (anchor) {
+      if (t0 === null) t0 = e.timestamp;
+      const tRel = (e.timestamp - t0) / 1000;
+      anchor.onDrSample({ tMs: e.timestamp, posX: e.posX, posY: e.posY, heading: e.heading, speedKmh: e.speedUsed });
+      // Новий GPS-фікс = зміна lat/lon (як у compare.py)
+      const isFix = Number.isFinite(lat) && Number.isFinite(lon) && (lat !== prevLat || lon !== prevLon);
+      let mockErrM = '';
+      const pre = anchor.getPosition(e.timestamp);
+      if (isFix) {
+        if (prevLat !== null && pre.state !== 'waiting') {
+          mockErrM = mDist(pre.lat, pre.lon, lat, lon);
+          if (pre.state === 'gps') errGps.push(mockErrM);
+          if (gpsOffAfterS !== null && tRel >= gpsOffAfterS) errAfterOff.push({ t: tRel, err: mockErrM, state: pre.state });
+        }
+        const gpsOff = gpsOffAfterS !== null && tRel >= gpsOffAfterS;
+        if (!gpsOff) {
+          anchor.onGpsFix({
+            tMs: e.timestamp, lat, lon,
+            accuracy: numOrNull(c, 'gpsAccuracy'),
+            mock: 'gpsMock' in col ? c[col.gpsMock] === 'true' : false,
+          });
+        }
+        prevLat = lat;
+        prevLon = lon;
+      }
+      const pos = anchor.getPosition(e.timestamp);
+      e.mockLat = pos.lat; e.mockLon = pos.lon; e.mockBearing = pos.bearing; e.anchorState = pos.state; e.mockErrM = mockErrM;
+    }
+    out.push(outCols.map((k) => (e[k] === null || e[k] === undefined ? '' : e[k])).join(','));
+  }
 }
 writeFileSync(outPath, out.join('\n'));
 const s = telemetry.getNavState();
 console.log(`Відтворено ${out.length - 1} точок -> ${outPath}`);
 console.log(`Кінцевий стан: heading=${s.heading.toFixed(1)}° posX=${s.posX.toFixed(1)} posY=${s.posY.toFixed(1)} bias=${s.gyroBias.toFixed(3)}°/с`);
+if (anchor) {
+  const fmt = (a) => (a.length ? `n=${a.length} медіана=${median(a).toFixed(1)} м макс=${Math.max(...a).toFixed(1)} м` : 'немає даних');
+  console.log(`geoAnchor: відстань позиції для Waze від GPS у моменти фіксів, anchorState="gps": ${fmt(errGps)}`);
+  if (gpsOffAfterS !== null) {
+    const errs = errAfterOff.map((x) => x.err);
+    const lastErr = errAfterOff.length ? errAfterOff[errAfterOff.length - 1].err : NaN;
+    console.log(`geoAnchor, --gps-off-after=${gpsOffAfterS}: після цього часу (GPS не подається): ${fmt(errs)} остання=${Number.isFinite(lastErr) ? lastErr.toFixed(1) : '-'} м`);
+  }
+}
 process.exit(0); // таймер flush у telemetry тримає процес

@@ -227,6 +227,9 @@ export default function App() {
         anchorAgeS: anchorPos.anchorAgeS,
         headingOffsetDeg: anchorPos.headingOffsetDeg,
         anchorState: anchorPos.state,
+        anchorSource: anchorPos.source,
+        netFitN: anchorPos.netFitN,
+        netFitResidM: anchorPos.netFitResidM,
         pressure: d.pressure,
         lat: d.lat,
         lon: d.lon,
@@ -426,6 +429,17 @@ export default function App() {
             d.netLon = e.lon;
             d.netAccuracy = e.accuracy ?? null;
             d.netRxMs = Date.now();
+            // Мережеві фікси збираємо завжди: мережева прив'язка має бути готова одразу після втрати GPS.
+            // Вік фіксу = час прийому − Location.time; застарілі (> 1.5 с) geoAnchor відкидає.
+            const netAgeMs = typeof e.timeMs === 'number' ? Math.max(0, d.netRxMs - e.timeMs) : 0;
+            geoAnchor.onNetFix({
+              tMs: d.netRxMs - netAgeMs,
+              lat: e.lat,
+              lon: e.lon,
+              accuracy: e.accuracy,
+              ageMs: netAgeMs,
+              mock: e.isMock,
+            });
           }),
           gnssEmitter.addListener('gnssFusedFix', (e) => {
             const d = latestData.current;
@@ -534,7 +548,7 @@ export default function App() {
 
   const feedWaze = async () => {
     const pos = geoAnchor.getPosition(Date.now());
-    if (pos.state === 'waiting') return; // θ ще не готовий — Waze лишається на справжньому GPS
+    if (pos.source === 'waiting') return; // прив'язки ще немає — Waze лишається на справжньому GPS
     try {
       // altitude не подаємо: GnssModule не віддає висоту
       await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
@@ -555,9 +569,11 @@ export default function App() {
       return;
     }
     if (!isRecording) {
-      ToastAndroid.show("Спершу почни запис (і ввімкни Еталонний GPS для прив'язки)", ToastAndroid.LONG);
+      ToastAndroid.show('Спершу почни запис', ToastAndroid.LONG);
       return;
     }
+    // Мережеві фікси дає GnssModule (запускається перемикачем «Еталонний GPS»): без нього прив'язка неможлива
+    if (!isGpsEnabled) setIsGpsEnabled(true);
     if (!MockLocationModule) return;
     try {
       await MockLocationModule.start(wazeMode);
@@ -585,9 +601,10 @@ export default function App() {
     }
     if (wazeError) return `Waze: ${wazeError}`;
     if (!wazeActive) return 'Waze: вимкнено';
-    if (anchorView.state === 'waiting') return 'Waze: очікую GPS для прив\'язки';
-    if (anchorView.state === 'gps') return `Waze: активно, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
-    return `Waze: без GPS, лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
+    if (anchorView.source === 'waiting') return "Waze: очікую мережу (або GPS) для прив'язки";
+    if (anchorView.source === 'gps') return `Waze: GPS, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
+    if (anchorView.source === 'network') return `Waze: мережа, ~${Math.round(anchorView.accuracy)} м`;
+    return `Waze: лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
   };
 
   const toggleRecording = async () => {

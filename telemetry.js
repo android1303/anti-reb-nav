@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v23)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v24)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -103,9 +103,13 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  * 23. Колонка mockMode ("fused" | "fusedGps" | null) — режим підміни
  *     геолокації. У режимі "fused" підміняється лише fused, а справжній
  *     GPS_PROVIDER лишається видимим застосунку.
+ *
+ * Зміни v24 (TASK-021, лише формат лога; розрахунок без змін):
+ * 24. Автоматична прив'язка DR за мережевою позицією (geoAnchor, пріоритет
+ *     GPS -> мережа -> DR): колонки anchorSource, netFitN, netFitResidM.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v23';
+export const CORE_VERSION = 'v24';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -163,7 +167,7 @@ export const CSV_COLUMNS = [
   'nGyroAgeMs', 'nAccAgeMs', 'nGravAgeMs', 'sensorSource', 'appState',
   'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
   'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
-  'mockMode',
+  'mockMode', 'anchorSource', 'netFitN', 'netFitResidM',
 ];
 
 const num = (v) => {
@@ -346,6 +350,7 @@ class TelemetryService {
     mockActive = null, mockLat = null, mockLon = null, mockAccuracy = null, mockBearing = null,
     anchorAgeS = null, headingOffsetDeg = null, anchorState = null, // geoAnchor (лише лог)
     mockMode = null,
+    anchorSource = null, netFitN = null, netFitResidM = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -637,6 +642,9 @@ class TelemetryService {
       uBiasZ: numOrNull(uBiasZ),
       uGyroAgeMs: numOrNull(uGyroAgeMs),
       mockActive: typeof mockActive === 'boolean' ? mockActive : null,
+      anchorSource: ['gps', 'network', 'dr_only', 'waiting'].includes(anchorSource) ? anchorSource : null,
+      netFitN: numOrNull(netFitN),
+      netFitResidM: numOrNull(netFitResidM),
       mockMode: mockMode === 'fused' || mockMode === 'fusedGps' ? mockMode : null,
       mockLat: numOrNull(mockLat),
       mockLon: numOrNull(mockLon),

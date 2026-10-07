@@ -22,7 +22,7 @@
  * API:
  *   const ga = createGeoAnchor();
  *   ga.onDrSample({ tMs, posX, posY, heading, speedKmh });         // кожен тік ядра
- *   ga.onGpsFix({ tMs, lat, lon, accuracy, mock });                // кожен новий GPS-фікс
+ *   ga.onGpsFix({ tMs, lat, lon, accuracy, mock, rebSim });        // кожен новий GPS-фікс (rebSim — TASK-026)
  *   ga.onNetFix({ tMs, lat, lon, accuracy, ageMs, mock });         // кожен новий мережевий фікс
  *   ga.getPosition(nowMs) -> { state, source, lat, lon, bearing, accuracy, anchorAgeS,
  *                              headingOffsetDeg, netFitN, netFitResidM, netFitPathM }
@@ -173,7 +173,11 @@ export function createGeoAnchor() {
   });
 
   // ---------------------------- GPS ----------------------------
-  const onGpsFix = ({ tMs, lat, lon, accuracy, mock }) => {
+  // rebSim (TASK-026, «Симуляція РЕБ: GPS лише для старту прив'язки»): якщо GPS-прив'язка вже готова,
+  // фікс ігнорується повністю (не оновлює origin, θ і свіжість GPS) — далі лише DR, потім мережа;
+  // поки прив'язки немає — фікс обробляється як звичайно (θ і origin за ~150 м руху).
+  const onGpsFix = ({ tMs, lat, lon, accuracy, mock, rebSim = false }) => {
+    if (rebSim === true && origin !== null && thetaRad !== null) return;
     // Фікс від mock-провайдера (наша ж позиція) НІКОЛИ не використовується: заморожуємо
     if (mock === true) {
       mockSeen = true;

@@ -2,7 +2,7 @@
 /**
  * Відтворення заїзду: подає сирі колонки CSV у справжнє ядро telemetry.js.
  *
- *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>]
+ *   node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [шлях_до_ядра] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>] [--reb-sim-all]
  *
  * За замовчуванням ядро = ./telemetry.js, вихід = replay_out.csv.
  * Щоб перевірити інші константи — скопіюй telemetry.js у тимчасовий файл,
@@ -18,8 +18,11 @@
  * від GPS у моменти GPS-фіксів (до переприв'язки) окремо для кожного anchorSource. --gps-off-after=<с від початку>: після цього часу
  * geoAnchor не отримує GPS-фіксів (режим «без GPS»); істинний GPS у даних лишається для оцінки.
  * --gps-off-after=0 відтворює чисто мережевий режим.
- * Якщо в CSV є колонка rebSim і на рядку rebSim = true («Симуляція РЕБ»), GPS-фікси в geoAnchor
- * на цьому рядку не подаються (відтворення збігається з живим станом); істинний GPS лишається для оцінки.
+ * «Симуляція РЕБ» (TASK-023, TASK-026): рядок з rebSim = true і rebSimMode = 'gps_start' (логи v26) —
+ * GPS-фікс подається в geoAnchor з rebSim: true (GPS лише для старту прив'язки: після першої GPS-прив'язки
+ * geoAnchor його ігнорує); рядок з rebSim = true без колонки rebSimMode (логи v25) — GPS-фікс не подається
+ * (як і було). --reb-sim-all: усі рядки трактуються як rebSim = true, rebSimMode = 'gps_start' (для старих
+ * заїздів без симуляції). Істинний GPS лишається для оцінки.
  * Потрібен devDependency esbuild. Далі: python3 (Windows: python) tools/replay/compare.py replay_out.csv
  */
 import { build } from 'esbuild';
@@ -32,11 +35,12 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const argv = process.argv.filter((a) => !a.startsWith('--'));
 const forceExpo = process.argv.includes('--sensors=expo');
 const useAnchor = process.argv.includes('--anchor');
+const rebSimAll = process.argv.includes('--reb-sim-all');
 const gpsOffArg = process.argv.find((a) => a.startsWith('--gps-off-after='));
 const gpsOffAfterS = gpsOffArg ? Number(gpsOffArg.split('=')[1]) : null;
 const [, , csvPath, outPath = 'replay_out.csv', corePath = 'telemetry.js', sessionId] = argv;
 if (!csvPath) {
-  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>]');
+  console.error('Використання: node tools/replay/replay.mjs <вхідний.csv> [вихідний.csv] [ядро.js] [sessionId] [--sensors=expo] [--anchor] [--gps-off-after=<с>] [--reb-sim-all]');
   process.exit(1);
 }
 
@@ -117,6 +121,8 @@ if (useAnchor) outCols.push('mockLat', 'mockLon', 'mockBearing', 'anchorState', 
 const out = [outCols.join(',')];
 const anchor = useAnchor ? geoAnchorMod.createGeoAnchor() : null;
 let t0 = null;
+let drPath = 0, prevX = null, prevY = null;
+let firstAnchor = null, firstNetwork = null;
 let prevLat = null, prevLon = null;
 let prevNetLat = null, prevNetLon = null;
 const errBySource = { gps: [], network: [], dr_only: [] };
@@ -150,6 +156,8 @@ for (const line of lines.slice(1)) {
     if (anchor) {
       if (t0 === null) t0 = e.timestamp;
       const tRel = (e.timestamp - t0) / 1000;
+      if (prevX !== null) drPath += Math.hypot(e.posX - prevX, e.posY - prevY);
+      prevX = e.posX; prevY = e.posY;
       anchor.onDrSample({ tMs: e.timestamp, posX: e.posX, posY: e.posY, heading: e.heading, speedKmh: e.speedUsed });
       // Новий GPS-фікс = зміна lat/lon (як у compare.py)
       const isFix = Number.isFinite(lat) && Number.isFinite(lon) && (lat !== prevLat || lon !== prevLon);
@@ -168,19 +176,24 @@ for (const line of lines.slice(1)) {
           errBySource[pre.source].push(mockErrM);
           if (gpsOffAfterS !== null && tRel >= gpsOffAfterS) errAfterOff.push({ t: tRel, err: mockErrM, state: pre.source });
         }
-        const rebRow = 'rebSim' in col && c[col.rebSim] === 'true';
-        const gpsOff = rebRow || (gpsOffAfterS !== null && tRel >= gpsOffAfterS);
+        const rebRow = rebSimAll || ('rebSim' in col && c[col.rebSim] === 'true');
+        const gpsStartMode = rebSimAll || ('rebSimMode' in col && c[col.rebSimMode] === 'gps_start');
+        // v25: rebSim без rebSimMode — GPS не подається; v26 gps_start — подається з rebSim: true
+        const gpsOff = (rebRow && !gpsStartMode) || (gpsOffAfterS !== null && tRel >= gpsOffAfterS);
         if (!gpsOff) {
           anchor.onGpsFix({
             tMs: e.timestamp, lat, lon,
             accuracy: numOrNull(c, 'gpsAccuracy'),
             mock: 'gpsMock' in col ? c[col.gpsMock] === 'true' : false,
+            rebSim: rebRow && gpsStartMode,
           });
         }
         prevLat = lat;
         prevLon = lon;
       }
       const pos = anchor.getPosition(e.timestamp);
+      if (firstAnchor === null && pos.source !== 'waiting') firstAnchor = { t: tRel, path: drPath, source: pos.source };
+      if (firstNetwork === null && pos.source === 'network') firstNetwork = { t: tRel, path: drPath };
       e.mockLat = pos.lat; e.mockLon = pos.lon; e.mockBearing = pos.bearing; e.anchorState = pos.state; e.anchorSource = pos.source; e.netFitN = pos.netFitN; e.netFitResidM = pos.netFitResidM; e.mockErrM = mockErrM;
     }
     out.push(outCols.map((k) => (e[k] === null || e[k] === undefined ? '' : e[k])).join(','));
@@ -193,6 +206,8 @@ console.log(`Кінцевий стан: heading=${s.heading.toFixed(1)}° posX=$
 if (anchor) {
   const pct90 = (a) => { const x = [...a].sort((p, q) => p - q); return x[Math.min(x.length - 1, Math.floor(x.length * 0.9))]; };
   const fmt = (a) => (a.length ? `n=${a.length} медіана=${median(a).toFixed(1)} м 90%=${pct90(a).toFixed(1)} м макс=${Math.max(...a).toFixed(1)} м` : 'немає даних');
+  const fm = (x) => (x ? `${x.t.toFixed(1)} с, пробіг DR ${x.path.toFixed(0)} м` : 'не настала');
+  console.log(`geoAnchor: перша прив'язка: ${firstAnchor ? fm(firstAnchor) + ', джерело ' + firstAnchor.source : 'не настала'}; мережева підгонка готова (source=network): ${fm(firstNetwork)}`);
   for (const src of ['gps', 'network', 'dr_only']) {
     console.log(`geoAnchor: відстань позиції для Waze від GPS у моменти фіксів, anchorSource="${src}": ${fmt(errBySource[src])}`);
   }

@@ -42,7 +42,7 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-024';
+const LAST_TASK = 'TASK-026';
 const OBD_LOST_BANNER_MS = 5000; // OBD несвіжий довше — червона смуга і сповіщення «OBD втрачено»
 const WAZE_FIX_WAIT_MS = 30000; // жодного свіжого фіксу GPS чи мережі за цей час — «очікую GPS або мережу»
 const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
@@ -239,6 +239,7 @@ export default function App() {
         appState: AppState.currentState,
         mockActive: mockRunningRef.current,
         rebSim: rebSimRef.current,
+        rebSimMode: 'gps_start',
         mockMode: mockRunningRef.current ? 'fused' : null,
         mockLat: anchorPos.lat,
         mockLon: anchorPos.lon,
@@ -443,10 +444,15 @@ export default function App() {
             d.gpsMock = typeof e.isMock === 'boolean' ? e.isMock : null;
             d.gpsRxMs = Date.now();
             // Фікси з isMock = true (наша ж підміна) geoAnchor ігнорує і заморожує прив'язку
-            // У режимі «Симуляція РЕБ» GPS-фікс до geoAnchor не йде (решта обробки — без змін)
-            if (!rebSimRef.current) {
-              geoAnchor.onGpsFix({ tMs: d.gpsRxMs, lat: e.lat, lon: e.lon, accuracy: e.accuracy, mock: e.isMock });
-            }
+            // «Симуляція РЕБ» = GPS лише для старту прив'язки: geoAnchor сам ігнорує фікси, коли прив'язка вже готова
+            geoAnchor.onGpsFix({
+              tMs: d.gpsRxMs,
+              lat: e.lat,
+              lon: e.lon,
+              accuracy: e.accuracy,
+              mock: e.isMock,
+              rebSim: rebSimRef.current,
+            });
           }),
           gnssEmitter.addListener('gnssNetFix', (e) => {
             const d = latestData.current;
@@ -657,24 +663,43 @@ export default function App() {
     }, 1000);
   };
 
+  // Чого бракує до підміни — в порядку перевірки (TASK-024); спільне для статусу і табло
+  const waitReason = () => {
+    if (obdStale) return "немає OBD — прив'язка неможлива";
+    if (!fixFresh) return 'очікую GPS або мережу';
+    if (anchorView.source === 'waiting') {
+      // У симуляції РЕБ спершу потрібен GPS для старту прив'язки (~150 м руху)
+      if (rebSim && anchorView.state === 'waiting') return 'чекаю GPS для старту (~150 м руху)';
+      return `збираю мережу — ${anchorView.netFitN ?? 0} фіксів, ${Math.round(anchorView.netFitPathM ?? 0)} з 1000 м`;
+    }
+    return "очікую прив'язку";
+  };
+
   const wazeStatusText = () => {
     if (wazeError === 'NOT_MOCK_APP') {
       return 'Waze: оберіть Anti-REB Nav як застосунок для фіктивних місцезнаходжень у Параметрах розробника';
     }
     if (wazeError) return `Waze: ${wazeError}`;
     if (!wazeArmed) return 'Waze: вимкнено';
-    if (!mockRunning) {
-      // Що саме бракує — в порядку перевірки
-      if (obdStale) return "Waze: немає OBD — прив'язка неможлива";
-      if (!fixFresh) return 'Waze: очікую GPS або мережу';
-      if (anchorView.source === 'waiting') {
-        return `Waze: збираю мережу — ${anchorView.netFitN ?? 0} фіксів, ${Math.round(anchorView.netFitPathM ?? 0)} з 1000 м`;
-      }
-      return "Waze: очікую прив'язку (Waze на власній геолокації)";
-    }
+    if (!mockRunning) return `Waze: ${waitReason()}`;
     if (anchorView.source === 'gps') return `Waze: GPS, прив'язка ${Math.round(anchorView.anchorAgeS)} с тому`;
     if (anchorView.source === 'network') return `Waze: мережа, ~${Math.round(anchorView.accuracy)} м`;
     return `Waze: лише DR (похибка ~${Math.round(anchorView.accuracy)} м)`;
+  };
+
+  // Табло (TASK-026): що саме зараз подається в систему; приховане, коли WAZE не озброєно.
+  // Тут лише факт підміни нашим розрахунком; чи бере Waze саме її — підтверджує окремий тест.
+  const wazeBoard = () => {
+    if (!wazeArmed) return null;
+    if (!mockRunning) {
+      return {
+        bg: '#475569',
+        text: `Підміни немає — Waze на власній геолокації (чекаю прив'язку: ${waitReason()})`,
+      };
+    }
+    if (anchorView.source === 'gps') return { bg: '#0369a1', text: 'ПІДМІНА: НАШ РОЗРАХУНОК ЗА GPS' };
+    const kind = anchorView.source === 'network' ? 'мережа' : 'DR';
+    return { bg: '#15803d', text: `ПІДМІНА: НАШ РОЗРАХУНОК (${kind}, ~${Math.round(anchorView.accuracy)} м)` };
   };
 
   const toggleRecording = async () => {
@@ -813,7 +838,7 @@ export default function App() {
 
       {rebSim && (
         <Text style={{ color: '#facc15', fontWeight: 'bold', fontSize: 12, textAlign: 'center', marginBottom: 10 }}>
-          СИМУЛЯЦІЯ РЕБ: GPS не використовується для прив'язки
+          СИМУЛЯЦІЯ РЕБ: GPS лише для старту прив'язки
         </Text>
       )}
 
@@ -917,6 +942,11 @@ export default function App() {
       </View>
 
       <View style={{ marginBottom: 12 }}>
+        {wazeBoard() && (
+          <View style={{ backgroundColor: wazeBoard().bg, borderRadius: 8, paddingVertical: 14, paddingHorizontal: 10, marginBottom: 8 }}>
+            <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 18, textAlign: 'center' }}>{wazeBoard().text}</Text>
+          </View>
+        )}
         <TouchableOpacity
           style={[
             styles.syncBtn,

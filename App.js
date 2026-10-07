@@ -42,7 +42,8 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-028';
+const LAST_TASK = 'TASK-025';
+const GNSS_SILENT_MS = 60000; // TASK-025: від GnssModule жодної події стільки часу — смуга «GNSS МОВЧИТЬ»
 const OBD_LOST_BANNER_MS = 5000; // OBD несвіжий довше — червона смуга і сповіщення «OBD втрачено»
 const WAZE_FIX_WAIT_MS = 30000; // жодного свіжого фіксу GPS чи мережі за цей час — «очікую GPS або мережу»
 const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
@@ -58,6 +59,7 @@ const formatHHMMSS = (ms) => {
 export default function App() {
   const [currentSpeed, setCurrentSpeed] = useState(0);
   const [obdStale, setObdStale] = useState(true);
+  const [gnssSilent, setGnssSilent] = useState(false); // TASK-025
   const [obdLost, setObdLost] = useState(false); // під час запису OBD несвіжий > 5 с
   const [fixFresh, setFixFresh] = useState(false); // є свіжий фікс GPS або мережі (≤ 30 с)
   const [currentPressure, setCurrentPressure] = useState(0);
@@ -72,6 +74,7 @@ export default function App() {
   const [syncError, setSyncError] = useState(null);
   const syncErrorTimer = useRef(null);
   const isRecordingRef = useRef(false);
+  const isGpsEnabledRef = useRef(false);
   const [wazeArmed, setWazeArmed] = useState(false); // WAZE «озброєно»: подача вмикається, щойно є позиція
   const [mockRunning, setMockRunning] = useState(false); // нативна підміна реально активна
   const [wazeError, setWazeError] = useState(null);
@@ -108,6 +111,8 @@ export default function App() {
     fusedRxMs: 0,
     st: null, // останній gnssStatus
     stRxMs: 0,
+    gnssEventMs: 0, // остання подія GnssModule (gnssGpsFix/NetFix/FusedFix/Status)
+    gnssWatchSinceMs: 0, // відлік «GNSS МОВЧИТЬ»: ввімкнення GPS або старт запису
     // expo-sensors (працюють лише поки застосунок на екрані)
     expoGyroTs: 0,
     expoMotionTs: 0,
@@ -348,6 +353,11 @@ export default function App() {
       const g = latestData.current;
       const nowMs = Date.now();
       setObdLost(isRecordingRef.current && (!last || nowMs - last > OBD_LOST_BANNER_MS));
+      setGnssSilent(
+        isRecordingRef.current &&
+          isGpsEnabledRef.current &&
+          nowMs - Math.max(g.gnssEventMs, g.gnssWatchSinceMs) > GNSS_SILENT_MS
+      );
       setFixFresh(nowMs - Math.max(g.gpsRxMs, g.netRxMs) <= WAZE_FIX_WAIT_MS);
       setGnssView({
         hasFix: !!g.gpsRxMs && nowMs - g.gpsRxMs <= GPS_FIX_STALE_MS,
@@ -438,6 +448,8 @@ export default function App() {
   // Нативний GnssModule: GPS-приймач, мережева позиція і стан супутників окремо.
   // Без Location.watchPositionAsync — він показує діалог «Точна геолокація».
   useEffect(() => {
+    isGpsEnabledRef.current = isGpsEnabled;
+    if (isGpsEnabled) latestData.current.gnssWatchSinceMs = Date.now();
     if (!isGpsEnabled || !gnssEmitter) return undefined;
     let cancelled = false;
     const subs = [];
@@ -451,6 +463,7 @@ export default function App() {
         if (cancelled) return;
         subs.push(
           gnssEmitter.addListener('gnssGpsFix', (e) => {
+            latestData.current.gnssEventMs = Date.now();
             const d = latestData.current;
             d.lat = e.lat;
             d.lon = e.lon;
@@ -469,6 +482,7 @@ export default function App() {
             });
           }),
           gnssEmitter.addListener('gnssNetFix', (e) => {
+            latestData.current.gnssEventMs = Date.now();
             const d = latestData.current;
             d.netLat = e.lat;
             d.netLon = e.lon;
@@ -495,6 +509,7 @@ export default function App() {
             });
           }),
           gnssEmitter.addListener('gnssFusedFix', (e) => {
+            latestData.current.gnssEventMs = Date.now();
             const d = latestData.current;
             d.fusedLat = e.lat;
             d.fusedLon = e.lon;
@@ -502,6 +517,7 @@ export default function App() {
             d.fusedRxMs = Date.now();
           }),
           gnssEmitter.addListener('gnssStatus', (e) => {
+            latestData.current.gnssEventMs = Date.now();
             latestData.current.st = e;
             latestData.current.stRxMs = Date.now();
           })
@@ -717,8 +733,18 @@ export default function App() {
     return { bg: '#15803d', text: `ПІДМІНА: НАШ РОЗРАХУНОК (${kind}, ~${Math.round(anchorView.accuracy)} м)` };
   };
 
+  // TASK-025: під час запису «Еталонний GPS» не вимикається (випадкове вимкнення зупиняє й мережеві фікси)
+  const toggleGps = (value) => {
+    if (!value && isRecordingRef.current) {
+      ToastAndroid.show('GPS вимикається лише після зупинки запису', ToastAndroid.LONG);
+      return;
+    }
+    setIsGpsEnabled(value);
+  };
+
   const toggleRecording = async () => {
     if (!isRecording) {
+      latestData.current.gnssWatchSinceMs = Date.now();
       geoAnchor.reset(); // DR починається з нуля — стара прив'язка недійсна
       latestData.current.netFixSeq = 0;
       // Android 13+: без дозволу сповіщення foreground service все одно працює, але його не видно
@@ -832,6 +858,11 @@ export default function App() {
           <Text style={{ color: 'white', fontWeight: 'bold', textAlign: 'center', letterSpacing: 1 }}>OBD ВТРАЧЕНО</Text>
         </View>
       )}
+      {gnssSilent && (
+        <View style={{ backgroundColor: '#ca8a04', borderRadius: 6, paddingVertical: 8, marginBottom: 8 }}>
+          <Text style={{ color: 'white', fontWeight: 'bold', textAlign: 'center', letterSpacing: 1 }}>GNSS МОВЧИТЬ</Text>
+        </View>
+      )}
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
@@ -907,9 +938,10 @@ export default function App() {
         <Text style={styles.toggleLabel}>Еталонний GPS</Text>
         <Switch
           value={isGpsEnabled}
-          onValueChange={setIsGpsEnabled}
+          onValueChange={toggleGps}
           trackColor={{ false: '#334155', true: '#0284c7' }}
           thumbColor={'#fff'}
+          style={isRecording && isGpsEnabled ? { opacity: 0.45 } : undefined}
         />
       </View>
 

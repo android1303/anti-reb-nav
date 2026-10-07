@@ -13,7 +13,11 @@
  * ядро бере їх (sensorSource=native), інакше — старі gyroXRaw/accelX/gravX (expo).
  * --sensors=expo примусово ігнорує нативні колонки (порівняння еквівалентності).
  * --anchor (TASK-018, TASK-021): додатково відтворює geoAnchor.js (прив'язка DR до карти за GPS і
- * за мережевою позицією netLat/netLon, якщо вони є в CSV; пріоритет GPS -> мережа -> DR) і пише
+ * за мережевою позицією netLat/netLon, якщо вони є в CSV; новий мережевий фікс (TASK-028) визначається
+ * точно, як на телефоні, у такому порядку: (а) є колонка netFixSeq — новий фікс, коли netFixSeq зріс;
+ * (б) інакше є колонка netFixAgeMs — новий фікс, коли netFixAgeMs < попереднє − 200 і ≤ 1500
+ * (повтори тієї самої позиції теж рахуються); (в) інакше — за зміною netLat/netLon. onNetFix отримує
+ * ageMs = netFixAgeMs рядка (якщо колонка є; інакше 0); пріоритет GPS -> мережа -> DR) і пише
  * mockLat/mockLon/anchorState/anchorSource у вихідний CSV; у кінці друкує відстань позиції для Waze
  * від GPS у моменти GPS-фіксів (до переприв'язки) окремо для кожного anchorSource. --gps-off-after=<с від початку>: після цього часу
  * geoAnchor не отримує GPS-фіксів (режим «без GPS»); істинний GPS у даних лишається для оцінки.
@@ -125,6 +129,7 @@ let drPath = 0, prevX = null, prevY = null;
 let firstAnchor = null, firstNetwork = null;
 let prevLat = null, prevLon = null;
 let prevNetLat = null, prevNetLon = null;
+let prevNetSeq = 0, prevNetAge = null;
 const errBySource = { gps: [], network: [], dr_only: [] };
 const errAfterOff = [];
 const mDist = (la1, lo1, la2, lo2) => {
@@ -162,12 +167,26 @@ for (const line of lines.slice(1)) {
       // Новий GPS-фікс = зміна lat/lon (як у compare.py)
       const isFix = Number.isFinite(lat) && Number.isFinite(lon) && (lat !== prevLat || lon !== prevLon);
       let mockErrM = '';
-      // Мережевий фікс = зміна netLat/netLon (колонки є в CSV від v18)
+      // Новий мережевий фікс (TASK-028): netFixSeq -> скидання netFixAgeMs -> зміна netLat/netLon
       const netLat = numOrNull(c, 'netLat'), netLon = numOrNull(c, 'netLon');
-      if (netLat !== null && netLon !== null && (netLat !== prevNetLat || netLon !== prevNetLon)) {
-        anchor.onNetFix({ tMs: e.timestamp, lat: netLat, lon: netLon, accuracy: numOrNull(c, 'netAccuracy'), ageMs: 0 });
-        prevNetLat = netLat;
-        prevNetLon = netLon;
+      const netAge = numOrNull(c, 'netFixAgeMs');
+      let newNet = false;
+      if ('netFixSeq' in col) {
+        const seq = numOrNull(c, 'netFixSeq');
+        if (seq !== null) {
+          newNet = seq > prevNetSeq;
+          prevNetSeq = seq;
+        }
+      } else if ('netFixAgeMs' in col) {
+        newNet = netAge !== null && netAge <= 1500 && (prevNetAge === null || netAge < prevNetAge - 200);
+      } else {
+        newNet = netLat !== null && netLon !== null && (netLat !== prevNetLat || netLon !== prevNetLon);
+      }
+      prevNetAge = netAge;
+      prevNetLat = netLat;
+      prevNetLon = netLon;
+      if (newNet && netLat !== null && netLon !== null) {
+        anchor.onNetFix({ tMs: e.timestamp, lat: netLat, lon: netLon, accuracy: numOrNull(c, 'netAccuracy'), ageMs: netAge ?? 0 });
       }
       const pre = anchor.getPosition(e.timestamp);
       if (isFix) {

@@ -42,7 +42,7 @@ const FREEZE_AFTER_MS = 5000; // немає хороших фіксів довш
 
 // --- Мережа (TASK-021) ---
 const NET_MAX_AGE_MS = 1500; // приймаємо лише свіжі фікси
-const NET_MAX_ACCURACY_M = 500;
+const NET_MAX_ACCURACY_M = 300; // TASK-028: фікси 400–800 м (повтори позицій за 1–4 км) давали залишок підгонки ~1100 м
 const NET_WINDOW_PATH_M = 3000; // вікно підгонки
 const NET_OUTLIER_FACTOR = 3; // викид: відстань > max(3 × медіана, 150 м)
 const NET_OUTLIER_MIN_M = 150;

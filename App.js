@@ -42,7 +42,7 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-026';
+const LAST_TASK = 'TASK-028';
 const OBD_LOST_BANNER_MS = 5000; // OBD несвіжий довше — червона смуга і сповіщення «OBD втрачено»
 const WAZE_FIX_WAIT_MS = 30000; // жодного свіжого фіксу GPS чи мережі за цей час — «очікую GPS або мережу»
 const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
@@ -101,6 +101,7 @@ export default function App() {
     netLon: null,
     netAccuracy: null,
     netRxMs: 0,
+    netFixSeq: 0, // кількість подій gnssNetFix з початку запису (скидається на старті запису)
     fusedLat: null,
     fusedLon: null,
     fusedAccuracy: null,
@@ -252,6 +253,7 @@ export default function App() {
         mockActive: mockRunningRef.current,
         rebSim: rebSimRef.current,
         rebSimMode: 'gps_start',
+        netFixSeq: d.netFixSeq,
         mockMode: mockRunningRef.current ? 'fused' : null,
         mockLat: anchorPos.lat,
         mockLon: anchorPos.lon,
@@ -472,6 +474,7 @@ export default function App() {
             d.netLon = e.lon;
             d.netAccuracy = e.accuracy ?? null;
             d.netRxMs = Date.now();
+            d.netFixSeq += 1;
             // Мережеві фікси збираємо завжди: мережева прив'язка має бути готова одразу після втрати GPS.
             // Вік фіксу = час прийому − Location.time; застарілі (> 1.5 с) geoAnchor відкидає.
             // Вік за монотонним часом Android (ageAtEmitMs від GnssModule) + час обробки події;
@@ -717,6 +720,7 @@ export default function App() {
   const toggleRecording = async () => {
     if (!isRecording) {
       geoAnchor.reset(); // DR починається з нуля — стара прив'язка недійсна
+      latestData.current.netFixSeq = 0;
       // Android 13+: без дозволу сповіщення foreground service все одно працює, але його не видно
       if (Platform.OS === 'android' && Platform.Version >= 33) {
         try {

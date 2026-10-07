@@ -4,7 +4,7 @@ import { collection, writeBatch, doc } from 'firebase/firestore';
 import { setBgInterval, clearBgInterval } from './bgScheduler';
 
 /* =====================================================================
- * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v27)
+ * Anti-Reb Nav — ядро телеметрії та Dead Reckoning (v28)
  *
  * Зміни відносно v13:
  *  1. Гіроскоп expo-sensors віддає рад/с -> конвертація в град/с.
@@ -121,9 +121,12 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  * 27. Колонка netFixSeq — лічильник подій gnssNetFix (+1 на кожну подію, скидається
  *     на старті запису): replay точно відрізняє новий мережевий фікс від повтору
  *     тієї самої позиції.
+ *
+ * Зміни v28 (TASK-029, лише формат лога; розрахунок без змін):
+ * 28. Колонка mockTestOffsetM — зсув поданої в Waze позиції в тесті (300 м під час тесту, 0 поза ним).
  * ===================================================================== */
 
-export const CORE_VERSION = 'v27';
+export const CORE_VERSION = 'v28';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -182,7 +185,7 @@ export const CSV_COLUMNS = [
   'uGyroX', 'uGyroY', 'uGyroZ', 'uBiasX', 'uBiasY', 'uBiasZ', 'uGyroAgeMs',
   'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
   'mockMode', 'anchorSource', 'netFitN', 'netFitResidM',
-  'rebSim', 'rebSimMode', 'netFixSeq',
+  'rebSim', 'rebSimMode', 'netFixSeq', 'mockTestOffsetM',
 ];
 
 const num = (v) => {
@@ -366,7 +369,7 @@ class TelemetryService {
     anchorAgeS = null, headingOffsetDeg = null, anchorState = null, // geoAnchor (лише лог)
     mockMode = null,
     anchorSource = null, netFitN = null, netFitResidM = null,
-    rebSim = null, rebSimMode = null, netFixSeq = null,
+    rebSim = null, rebSimMode = null, netFixSeq = null, mockTestOffsetM = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -661,6 +664,7 @@ class TelemetryService {
       rebSim: typeof rebSim === 'boolean' ? rebSim : null,
       rebSimMode: typeof rebSimMode === 'string' && rebSimMode ? rebSimMode : null,
       netFixSeq: numOrNull(netFixSeq),
+      mockTestOffsetM: numOrNull(mockTestOffsetM),
       anchorSource: ['gps', 'network', 'dr_only', 'waiting'].includes(anchorSource) ? anchorSource : null,
       netFitN: numOrNull(netFitN),
       netFitResidM: numOrNull(netFitResidM),

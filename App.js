@@ -42,8 +42,10 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-025';
+const LAST_TASK = 'TASK-029';
 const GNSS_SILENT_MS = 60000; // TASK-025: від GnssModule жодної події стільки часу — смуга «GNSS МОВЧИТЬ»
+const WAZE_TEST_OFFSET_M = 300; // TASK-029: зсув позиції на північ у тесті Waze
+const WAZE_TEST_DURATION_MS = 60000;
 const OBD_LOST_BANNER_MS = 5000; // OBD несвіжий довше — червона смуга і сповіщення «OBD втрачено»
 const WAZE_FIX_WAIT_MS = 30000; // жодного свіжого фіксу GPS чи мережі за цей час — «очікую GPS або мережу»
 const SETTINGS_FILE = (FileSystem.documentDirectory || '') + 'settings.json';
@@ -82,6 +84,8 @@ export default function App() {
   const wazeArmedRef = useRef(false);
   const mockRunningRef = useRef(false);
   const wazeBusyRef = useRef(false);
+  const wazeTestEndRef = useRef(0); // TASK-029: до якого моменту (мс) подається позиція зі зсувом; 0 — тесту немає
+  const [wazeTest, setWazeTest] = useState({ leftS: 0, fusedDistM: null });
   const wazeTimerRef = useRef(null);
   const lastSpeedMpsRef = useRef(0);
   const [isExporting, setIsExporting] = useState(false);
@@ -111,7 +115,7 @@ export default function App() {
     fusedRxMs: 0,
     st: null, // останній gnssStatus
     stRxMs: 0,
-    gnssEventMs: 0, // остання подія GnssModule (gnssGpsFix/NetFix/FusedFix/Status)
+    gnssEventMs: 0, // остання подія GnssModule (gnssGpsFix/NetFix/Status; fused не рахується — під час підміни віддає нашу позицію)
     gnssWatchSinceMs: 0, // відлік «GNSS МОВЧИТЬ»: ввімкнення GPS або старт запису
     // expo-sensors (працюють лише поки застосунок на екрані)
     expoGyroTs: 0,
@@ -221,6 +225,7 @@ export default function App() {
       const nativeOk = !!d.lastNativeTickMs && now - d.lastNativeTickMs <= NATIVE_TICK_STALE_MS;
       const age = (rx) => (rx ? Math.max(0, now - rx) : null);
       const anchorPos = geoAnchor.getPosition(now);
+      const testOffsetM = mockRunningRef.current && wazeTestEndRef.current > now ? WAZE_TEST_OFFSET_M : 0;
       const entry = telemetry.recordPoint({
         speed: d.speed,
         obdAgeMs: d.lastObdUpdateTime ? now - d.lastObdUpdateTime : Infinity,
@@ -260,8 +265,9 @@ export default function App() {
         rebSimMode: 'gps_start',
         netFixSeq: d.netFixSeq,
         mockMode: mockRunningRef.current ? 'fused' : null,
-        mockLat: anchorPos.lat,
+        mockLat: testOffsetM && anchorPos.lat != null ? anchorPos.lat + testOffsetM / 111320 : anchorPos.lat,
         mockLon: anchorPos.lon,
+        mockTestOffsetM: testOffsetM,
         mockAccuracy: anchorPos.accuracy,
         mockBearing: anchorPos.bearing,
         anchorAgeS: anchorPos.anchorAgeS,
@@ -348,6 +354,20 @@ export default function App() {
       setBufferCount(telemetry.getBufferSize());
       setSyncState(telemetry.getSyncState());
       setAnchorView(geoAnchor.getPosition(Date.now()));
+      {
+        const leftMs = wazeTestEndRef.current - Date.now();
+        const gt = latestData.current;
+        let fd = null;
+        if (leftMs > 0 && gt.fusedLat != null && gt.fusedLon != null && gt.lat != null && gt.lon != null) {
+          const dN = (gt.fusedLat - gt.lat) * 111320;
+          const dE = (gt.fusedLon - gt.lon) * 111320 * Math.cos((gt.lat * Math.PI) / 180);
+          fd = Math.hypot(dN, dE);
+        }
+        setWazeTest((prev) => {
+          const leftS = leftMs > 0 ? Math.ceil(leftMs / 1000) : 0;
+          return prev.leftS === leftS && prev.fusedDistM === fd ? prev : { leftS, fusedDistM: fd };
+        });
+      }
       const last = latestData.current.lastObdUpdateTime;
       setObdStale(!last || Date.now() - last > OBD_STALE_MS);
       const g = latestData.current;
@@ -509,7 +529,6 @@ export default function App() {
             });
           }),
           gnssEmitter.addListener('gnssFusedFix', (e) => {
-            latestData.current.gnssEventMs = Date.now();
             const d = latestData.current;
             d.fusedLat = e.lat;
             d.fusedLon = e.lon;
@@ -603,6 +622,7 @@ export default function App() {
   // вмикається автоматично, коли geoAnchor має позицію, і вимикається, якщо позиції знову немає:
   // поки прив'язки немає, Waze працює на власній геолокації (вишки/Wi-Fi), а не губить її.
   const stopMock = async () => {
+    wazeTestEndRef.current = 0;
     mockRunningRef.current = false;
     setMockRunning(false);
     if (MockLocationModule) {
@@ -618,6 +638,7 @@ export default function App() {
     clearBgInterval(wazeTimerRef.current);
     wazeTimerRef.current = null;
     wazeArmedRef.current = false;
+    wazeTestEndRef.current = 0;
     setWazeArmed(false);
     if (mockRunningRef.current) await stopMock();
   };
@@ -652,7 +673,12 @@ export default function App() {
         setMockRunning(true);
       }
       // altitude не подаємо: GnssModule не віддає висоту
-      await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
+      if (wazeTestEndRef.current > Date.now()) {
+        // TASK-029: свідомий зсув на північ з високою заявленою точністю, швидкість 0
+        await MockLocationModule.push(pos.lat + WAZE_TEST_OFFSET_M / 111320, pos.lon, 5, 0, pos.bearing, 0, false);
+      } else {
+        await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
+      }
     } catch (e) {
       if (e && e.code === 'NOT_MOCK_APP') {
         await failWaze('NOT_MOCK_APP');
@@ -692,6 +718,23 @@ export default function App() {
     wazeTimerRef.current = setBgInterval(() => {
       feedWaze();
     }, 1000);
+  };
+
+  // Тест Waze (TASK-029): 60 с подається позиція на 300 м північніше — чи бере Waze її з fused
+  const startWazeTest = () => {
+    if (!isRecordingRef.current || !mockRunningRef.current) {
+      ToastAndroid.show('Спершу дочекайся підміни (WAZE)', ToastAndroid.LONG);
+      return;
+    }
+    Alert.alert('Тест Waze: 60 с подаватиметься позиція на 300 м північніше. Стій на місці.', undefined, [
+      { text: 'Скасувати', style: 'cancel' },
+      {
+        text: 'Почати',
+        onPress: () => {
+          if (mockRunningRef.current) wazeTestEndRef.current = Date.now() + WAZE_TEST_DURATION_MS;
+        },
+      },
+    ]);
   };
 
   // Чого бракує до підміни — в порядку перевірки (TASK-024); спільне для статусу і табло
@@ -1005,6 +1048,25 @@ export default function App() {
           <Text style={styles.syncBtnText}>{wazeArmed ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
         </TouchableOpacity>
         <Text style={{ color: '#94a3b8', fontSize: 11, textAlign: 'center', marginTop: 6 }}>{wazeStatusText()}</Text>
+        <TouchableOpacity
+          style={[
+            styles.syncBtn,
+            { flex: 0, width: '100%', marginTop: 8, paddingVertical: 8 },
+            wazeTest.leftS > 0 && { backgroundColor: '#b45309' },
+            !(isRecording && mockRunning) && wazeTest.leftS === 0 && { opacity: 0.45 },
+          ]}
+          onPress={startWazeTest}
+          disabled={wazeTest.leftS > 0}
+        >
+          <Text style={[styles.syncBtnText, { fontSize: 12 }]}>
+            {wazeTest.leftS > 0 ? `ТЕСТ: ${wazeTest.leftS} с` : 'ТЕСТ WAZE: ЗСУВ 300 м'}
+          </Text>
+        </TouchableOpacity>
+        {wazeTest.leftS > 0 && (
+          <Text style={{ color: '#fbbf24', fontSize: 12, textAlign: 'center', marginTop: 4 }}>
+            fused від GPS: {wazeTest.fusedDistM == null ? '—' : `${Math.round(wazeTest.fusedDistM)} м`}
+          </Text>
+        )}
       </View>
 
       <Text style={{ textAlign: 'center', color: '#64748b', fontSize: 11, marginTop: 5, marginBottom: 10 }}>

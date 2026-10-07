@@ -181,7 +181,7 @@ export default function App() {
   }, []);
 
   // Перемикати можна будь-коли; геoAnchor при цьому не скидається (далі працює за мережею/DR)
-  const toggleRebSim = async (value) => {
+  const applyRebSim = async (value) => {
     rebSimRef.current = value;
     setRebSim(value);
     try {
@@ -189,6 +189,18 @@ export default function App() {
     } catch (e) {
       console.warn('Налаштування не збережено:', e);
     }
+  };
+
+  // Під час запису зміна симуляції (в обидва боки) — лише після підтвердження; поза записом — одразу
+  const toggleRebSim = (value) => {
+    if (!isRecording) {
+      applyRebSim(value);
+      return;
+    }
+    Alert.alert(value ? 'Увімкнути симуляцію РЕБ?' : 'Вимкнути симуляцію РЕБ?', undefined, [
+      { text: 'Скасувати', style: 'cancel' },
+      { text: 'Так', onPress: () => applyRebSim(value) },
+    ]);
   };
 
   // Одна точка ядра. recordPoint синхронний — тики не накладаються.
@@ -836,12 +848,6 @@ export default function App() {
         </View>
       </View>
 
-      {rebSim && (
-        <Text style={{ color: '#facc15', fontWeight: 'bold', fontSize: 12, textAlign: 'center', marginBottom: 10 }}>
-          СИМУЛЯЦІЯ РЕБ: GPS лише для старту прив'язки
-        </Text>
-      )}
-
       <View style={styles.grid}>
         <View style={styles.card}>
           <Text style={styles.cardLabel}>ШВИДКІСТЬ (OBD)</Text>
@@ -903,16 +909,6 @@ export default function App() {
         />
       </View>
 
-      <View style={[styles.toggleRow, { marginTop: -10 }]}>
-        <Text style={styles.toggleLabel}>Симуляція РЕБ</Text>
-        <Switch
-          value={rebSim}
-          onValueChange={toggleRebSim}
-          trackColor={{ false: '#334155', true: '#ca8a04' }}
-          thumbColor={'#fff'}
-        />
-      </View>
-
       <View style={styles.bufferInfo}>
         <Text style={styles.bufferText}>
           Не синхр.: {bufferCount} | Синхр: {formatHHMMSS(syncState.lastSyncAt) || '--:--:--'}
@@ -941,7 +937,21 @@ export default function App() {
         </TouchableOpacity>
       </View>
 
-      <View style={{ marginBottom: 12 }}>
+      <View style={{ marginTop: 24, marginBottom: 12 }}>
+        <View style={[styles.toggleRow, { marginBottom: 8 }]}>
+          <Text style={styles.toggleLabel}>Симуляція РЕБ</Text>
+          <Switch
+            value={rebSim}
+            onValueChange={toggleRebSim}
+            trackColor={{ false: '#334155', true: '#ca8a04' }}
+            thumbColor={'#fff'}
+          />
+        </View>
+        {rebSim && (
+          <Text style={{ color: '#facc15', fontWeight: 'bold', fontSize: 12, textAlign: 'center', marginBottom: 12 }}>
+            СИМУЛЯЦІЯ РЕБ: GPS лише для старту прив'язки
+          </Text>
+        )}
         {wazeBoard() && (
           <View style={{ backgroundColor: wazeBoard().bg, borderRadius: 8, paddingVertical: 14, paddingHorizontal: 10, marginBottom: 8 }}>
             <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 18, textAlign: 'center' }}>{wazeBoard().text}</Text>

@@ -42,7 +42,7 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-029';
+const LAST_TASK = 'TASK-030';
 const GNSS_SILENT_MS = 60000; // TASK-025: від GnssModule жодної події стільки часу — смуга «GNSS МОВЧИТЬ»
 const WAZE_TEST_OFFSET_M = 300; // TASK-029: зсув позиції на північ у тесті Waze
 const WAZE_TEST_DURATION_MS = 60000;
@@ -70,6 +70,10 @@ export default function App() {
   // «Симуляція РЕБ»: geoAnchor не отримує GPS-фіксів (лише мережа і DR); GPS лишається еталоном у лозі
   const [rebSim, setRebSim] = useState(false);
   const rebSimRef = useRef(false);
+  // TASK-030: режим підміни: 'fusedGps' (fused + GPS_PROVIDER, за замовчуванням) або 'fused'
+  const [wazeMode, setWazeMode] = useState('fusedGps');
+  const wazeModeRef = useRef('fusedGps');
+  const activeModeRef = useRef(null); // режим, у якому підміна реально запущена
 
   const [bufferCount, setBufferCount] = useState(0);
   const [syncState, setSyncState] = useState(telemetry.getSyncState());
@@ -184,6 +188,10 @@ export default function App() {
           rebSimRef.current = saved.rebSim;
           setRebSim(saved.rebSim);
         }
+        if (saved && (saved.wazeMode === 'fused' || saved.wazeMode === 'fusedGps')) {
+          wazeModeRef.current = saved.wazeMode;
+          setWazeMode(saved.wazeMode);
+        }
       } catch (e) {
         console.warn('Налаштування не прочитано:', e);
       }
@@ -191,14 +199,21 @@ export default function App() {
   }, []);
 
   // Перемикати можна будь-коли; геoAnchor при цьому не скидається (далі працює за мережею/DR)
-  const applyRebSim = async (value) => {
-    rebSimRef.current = value;
-    setRebSim(value);
+  const saveSettings = async () => {
     try {
-      await FileSystem.writeAsStringAsync(SETTINGS_FILE, JSON.stringify({ rebSim: value }));
+      await FileSystem.writeAsStringAsync(
+        SETTINGS_FILE,
+        JSON.stringify({ rebSim: rebSimRef.current, wazeMode: wazeModeRef.current })
+      );
     } catch (e) {
       console.warn('Налаштування не збережено:', e);
     }
+  };
+
+  const applyRebSim = async (value) => {
+    rebSimRef.current = value;
+    setRebSim(value);
+    await saveSettings();
   };
 
   // Під час запису зміна симуляції (в обидва боки) — лише після підтвердження; поза записом — одразу
@@ -264,7 +279,7 @@ export default function App() {
         rebSim: rebSimRef.current,
         rebSimMode: 'gps_start',
         netFixSeq: d.netFixSeq,
-        mockMode: mockRunningRef.current ? 'fused' : null,
+        mockMode: mockRunningRef.current ? activeModeRef.current : null,
         mockLat: testOffsetM && anchorPos.lat != null ? anchorPos.lat + testOffsetM / 111320 : anchorPos.lat,
         mockLon: anchorPos.lon,
         mockTestOffsetM: testOffsetM,
@@ -483,7 +498,8 @@ export default function App() {
         if (cancelled) return;
         subs.push(
           gnssEmitter.addListener('gnssGpsFix', (e) => {
-            latestData.current.gnssEventMs = Date.now();
+            // TASK-030: фікс від нашої ж підміни GPS (isMock) — не ознака роботи GNSS
+            if (e.isMock !== true) latestData.current.gnssEventMs = Date.now();
             const d = latestData.current;
             d.lat = e.lat;
             d.lon = e.lon;
@@ -623,6 +639,7 @@ export default function App() {
   // поки прив'язки немає, Waze працює на власній геолокації (вишки/Wi-Fi), а не губить її.
   const stopMock = async () => {
     wazeTestEndRef.current = 0;
+    activeModeRef.current = null;
     mockRunningRef.current = false;
     setMockRunning(false);
     if (MockLocationModule) {
@@ -660,7 +677,7 @@ export default function App() {
       }
       if (!mockRunningRef.current) {
         try {
-          await MockLocationModule.start('fused');
+          await MockLocationModule.start(wazeModeRef.current);
         } catch (e) {
           await failWaze(e && e.code, e && e.message);
           return;
@@ -670,6 +687,7 @@ export default function App() {
           return;
         }
         mockRunningRef.current = true;
+        activeModeRef.current = wazeModeRef.current;
         setMockRunning(true);
       }
       // altitude не подаємо: GnssModule не віддає висоту
@@ -718,6 +736,26 @@ export default function App() {
     wazeTimerRef.current = setBgInterval(() => {
       feedWaze();
     }, 1000);
+  };
+
+  // TASK-030: зміна режиму підміни; активна підміна перезапускається в новому режимі (feedWaze стартує її сам)
+  const applyWazeMode = async (mode) => {
+    wazeModeRef.current = mode;
+    setWazeMode(mode);
+    await saveSettings();
+    if (mockRunningRef.current) await stopMock();
+  };
+
+  const toggleWazeMode = (useGps) => {
+    const mode = useGps ? 'fusedGps' : 'fused';
+    if (!isRecording) {
+      applyWazeMode(mode);
+      return;
+    }
+    Alert.alert('Змінити режим підміни?', undefined, [
+      { text: 'Скасувати', style: 'cancel' },
+      { text: 'Так', onPress: () => applyWazeMode(mode) },
+    ]);
   };
 
   // Тест Waze (TASK-029): 60 с подається позиція на 300 м північніше — чи бере Waze її з fused
@@ -1048,6 +1086,15 @@ export default function App() {
           <Text style={styles.syncBtnText}>{wazeArmed ? 'WAZE: ВИМКНУТИ' : 'WAZE'}</Text>
         </TouchableOpacity>
         <Text style={{ color: '#94a3b8', fontSize: 11, textAlign: 'center', marginTop: 6 }}>{wazeStatusText()}</Text>
+        <View style={[styles.toggleRow, { marginTop: 8 }]}>
+          <Text style={styles.toggleLabel}>Режим підміни: {wazeMode === 'fusedGps' ? 'Fused+GPS' : 'Fused'}</Text>
+          <Switch
+            value={wazeMode === 'fusedGps'}
+            onValueChange={toggleWazeMode}
+            trackColor={{ false: '#334155', true: '#0284c7' }}
+            thumbColor={'#fff'}
+          />
+        </View>
         <TouchableOpacity
           style={[
             styles.syncBtn,
@@ -1064,7 +1111,9 @@ export default function App() {
         </TouchableOpacity>
         {wazeTest.leftS > 0 && (
           <Text style={{ color: '#fbbf24', fontSize: 12, textAlign: 'center', marginTop: 4 }}>
-            fused від GPS: {wazeTest.fusedDistM == null ? '—' : `${Math.round(wazeTest.fusedDistM)} м`}
+            {wazeMode === 'fusedGps'
+              ? 'режим Fused+GPS: GPS підмінено, еталону немає'
+              : `fused від GPS: ${wazeTest.fusedDistM == null ? '—' : `${Math.round(wazeTest.fusedDistM)} м`}`}
           </Text>
         )}
       </View>

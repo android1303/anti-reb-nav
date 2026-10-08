@@ -20,6 +20,11 @@ ap.add_argument('--plot', default=None)
 a = ap.parse_args()
 
 df = pd.read_csv(a.csv)
+# TASK-030: фікси GPS від нашої ж підміни (gpsMock = true) не є еталоном
+if 'gpsMock' in df.columns:
+    mock = df['gpsMock'].astype(str).str.strip().str.lower() == 'true'
+    print(f'gpsMock = true: відкинуто {int(mock.sum())} рядків з еталона GPS')
+    df.loc[mock, ['lat', 'lon']] = np.nan
 df = df.dropna(subset=['lat', 'lon']).reset_index(drop=True)
 if df.empty:
     sys.exit('Немає GPS-даних (lat/lon) — порівняння неможливе.')

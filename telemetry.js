@@ -124,9 +124,15 @@ import { setBgInterval, clearBgInterval } from './bgScheduler';
  *
  * Зміни v28 (TASK-029, лише формат лога; розрахунок без змін):
  * 28. Колонка mockTestOffsetM — зсув поданої в Waze позиції в тесті (300 м під час тесту, 0 поза ним).
+ *
+ * Зміни v29 (TASK-033, лише формат лога; розрахунок без змін):
+ * 29. Колонка mockPushedAccuracy — фактично подана в Waze точність (mockAccuracy і далі
+ *     пише чесну оцінку geoAnchor); колонки nmeaLat, nmeaLon, nmeaFixAgeMs, nmeaQuality,
+ *     nmeaSats, nmeaHdop — NMEA-потік GPS-приймача ($GxRMC/$GxGGA), що обходить тестовий
+ *     провайдер: справжня позиція, коли підмінено GPS_PROVIDER. Лише лог.
  * ===================================================================== */
 
-export const CORE_VERSION = 'v28';
+export const CORE_VERSION = 'v29';
 const RAD2DEG = 180 / Math.PI;
 
 // --- Зберігання та синхронізація ---
@@ -186,6 +192,7 @@ export const CSV_COLUMNS = [
   'mockActive', 'mockLat', 'mockLon', 'mockAccuracy', 'mockBearing', 'anchorAgeS', 'headingOffsetDeg', 'anchorState',
   'mockMode', 'anchorSource', 'netFitN', 'netFitResidM',
   'rebSim', 'rebSimMode', 'netFixSeq', 'mockTestOffsetM',
+  'mockPushedAccuracy', 'nmeaLat', 'nmeaLon', 'nmeaFixAgeMs', 'nmeaQuality', 'nmeaSats', 'nmeaHdop',
 ];
 
 const num = (v) => {
@@ -370,6 +377,8 @@ class TelemetryService {
     mockMode = null,
     anchorSource = null, netFitN = null, netFitResidM = null,
     rebSim = null, rebSimMode = null, netFixSeq = null, mockTestOffsetM = null,
+    mockPushedAccuracy = null,
+    nmeaLat = null, nmeaLon = null, nmeaFixAgeMs = null, nmeaQuality = null, nmeaSats = null, nmeaHdop = null,
     pressure = 0,
     lat = null,
     lon = null,
@@ -665,6 +674,13 @@ class TelemetryService {
       rebSimMode: typeof rebSimMode === 'string' && rebSimMode ? rebSimMode : null,
       netFixSeq: numOrNull(netFixSeq),
       mockTestOffsetM: numOrNull(mockTestOffsetM),
+      mockPushedAccuracy: numOrNull(mockPushedAccuracy),
+      nmeaLat: numOrNull(nmeaLat),
+      nmeaLon: numOrNull(nmeaLon),
+      nmeaFixAgeMs: numOrNull(nmeaFixAgeMs),
+      nmeaQuality: numOrNull(nmeaQuality),
+      nmeaSats: numOrNull(nmeaSats),
+      nmeaHdop: numOrNull(nmeaHdop),
       anchorSource: ['gps', 'network', 'dr_only', 'waiting'].includes(anchorSource) ? anchorSource : null,
       netFitN: numOrNull(netFitN),
       netFitResidM: numOrNull(netFitResidM),

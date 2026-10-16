@@ -8,6 +8,7 @@ import android.location.GnssStatus
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.location.OnNmeaMessageListener
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -31,8 +32,9 @@ import com.google.android.gms.location.Priority
 /**
  * Окремі потоки: GPS-приймач (GPS_PROVIDER), мережева позиція (NETWORK_PROVIDER),
  * fused-позиція Google (FusedLocationProviderClient, без діалогів SettingsClient)
- * і стан супутників (GnssStatus).
- * Події: gnssGpsFix, gnssNetFix, gnssFusedFix, gnssStatus.
+ * і стан супутників (GnssStatus). TASK-033: NMEA-потік приймача (OnNmeaMessageListener) —
+ * справжні координати з $GxRMC/$GxGGA, навіть коли GPS_PROVIDER підмінено тестовим провайдером.
+ * Події: gnssGpsFix, gnssNetFix, gnssFusedFix, gnssStatus, gnssNmeaFix.
  */
 class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
 
@@ -43,6 +45,10 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
     private var gpsListener: LocationListener? = null
     private var netListener: LocationListener? = null
     private var statusCallback: GnssStatus.Callback? = null
+    private var nmeaListener: OnNmeaMessageListener? = null
+    private var nmeaQuality: Int? = null // остання якість фіксу з $GxGGA
+    private var nmeaSats: Int? = null
+    private var nmeaHdop: Double? = null
     private var fusedClient: FusedLocationProviderClient? = null
     private var fusedCallback: LocationCallback? = null
     private var lastStatusEmitMs = 0L
@@ -170,8 +176,73 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         }
     }
 
+    // --- NMEA (TASK-033): лише $GxRMC і $GxGGA; будь-яка помилка розбору ігнорується ---
+
+    /** ddmm.mmmm / dddmm.mmmm + N/S/E/W -> градуси; null, якщо формат хибний. */
+    private fun nmeaCoord(value: String, hemi: String, degDigits: Int): Double? {
+        if (value.length < degDigits + 2 || hemi.isEmpty()) return null
+        val deg = value.substring(0, degDigits).toDoubleOrNull() ?: return null
+        val min = value.substring(degDigits).toDoubleOrNull() ?: return null
+        val v = deg + min / 60.0
+        return when (hemi[0]) {
+            'N', 'E' -> v
+            'S', 'W' -> -v
+            else -> null
+        }
+    }
+
+    private fun handleNmeaSentence(raw: String) {
+        val line = raw.trim()
+        if (line.length < 7 || line[0] != '$') return
+        val f = line.substring(1).substringBefore('*').split(',')
+        val id = f[0]
+        if (id.length != 5) return
+        when (id.substring(2)) {
+            "GGA" -> {
+                // 0 id, 1 time, 2 lat, 3 N/S, 4 lon, 5 E/W, 6 quality, 7 sats, 8 hdop
+                if (f.size < 9) return
+                nmeaQuality = f[6].toIntOrNull()
+                nmeaSats = f[7].toIntOrNull()
+                nmeaHdop = f[8].toDoubleOrNull()
+            }
+            "RMC" -> {
+                // 0 id, 1 time, 2 status, 3 lat, 4 N/S, 5 lon, 6 E/W, 7 speed (вузли), 8 course
+                if (f.size < 9 || f[2] != "A") return
+                val lat = nmeaCoord(f[3], f[4], 2) ?: return
+                val lon = nmeaCoord(f[5], f[6], 3) ?: return
+                val map = Arguments.createMap()
+                map.putDouble("lat", lat)
+                map.putDouble("lon", lon)
+                map.putBoolean("valid", true)
+                val q = nmeaQuality
+                val sats = nmeaSats
+                val hdop = nmeaHdop
+                if (q != null) map.putInt("quality", q) else map.putNull("quality")
+                if (sats != null) map.putInt("sats", sats) else map.putNull("sats")
+                if (hdop != null) map.putDouble("hdop", hdop) else map.putNull("hdop")
+                val spd = f[7].toDoubleOrNull()
+                if (spd != null) map.putDouble("speedMps", spd * 0.514444) else map.putNull("speedMps")
+                val crs = f[8].toDoubleOrNull()
+                if (crs != null) map.putDouble("courseDeg", crs) else map.putNull("courseDeg")
+                map.putDouble("rxMs", System.currentTimeMillis().toDouble())
+                emit("gnssNmeaFix", map)
+            }
+        }
+    }
+
+    private fun makeNmeaListener(): OnNmeaMessageListener {
+        return OnNmeaMessageListener { message, _ ->
+            try {
+                for (s in message.split('\n')) handleNmeaSentence(s)
+            } catch (e: Exception) {
+                // помилки розбору ігноруємо
+            }
+        }
+    }
+
     private fun startedMap(): WritableMap {
         return Arguments.createMap().apply {
+            putBoolean("nmea", nmeaListener != null)
             putBoolean("gps", gpsListener != null)
             putBoolean("network", netListener != null)
             putBoolean("fused", fusedCallback != null)
@@ -201,6 +272,9 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         }
         locationManager = lm
         lastStatusEmitMs = 0L
+        nmeaQuality = null
+        nmeaSats = null
+        nmeaHdop = null
 
         // GPS_PROVIDER реєструємо й коли він зараз вимкнено: LocationManager приймає
         // підписку і почне видавати фікси після ввімкнення геолокації в системі.
@@ -264,6 +338,16 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
             Log.e(TAG, "Помилка запуску GnssStatus: ", e)
         }
 
+        // NMEA-слухач живе разом із GPS-слухачем (TASK-033); приймач віддає справжні дані і при підміні GPS_PROVIDER
+        if (gpsListener != null) {
+            try {
+                val l = makeNmeaListener()
+                if (lm.addNmeaListener(l, mainHandler)) nmeaListener = l
+            } catch (e: Exception) {
+                Log.e(TAG, "Помилка запуску NMEA: ", e)
+            }
+        }
+
         running = gpsListener != null || netListener != null || fusedCallback != null || statusCallback != null
         promise.resolve(startedMap())
     }
@@ -280,6 +364,7 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
             gpsListener?.let { lm?.removeUpdates(it) }
             netListener?.let { lm?.removeUpdates(it) }
             statusCallback?.let { lm?.unregisterGnssStatusCallback(it) }
+            nmeaListener?.let { lm?.removeNmeaListener(it) }
         } catch (e: Exception) {
             Log.e(TAG, "Помилка зупинки: ", e)
         }
@@ -291,6 +376,7 @@ class GnssModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaMo
         gpsListener = null
         netListener = null
         statusCallback = null
+        nmeaListener = null
         fusedCallback = null
         fusedClient = null
         running = false

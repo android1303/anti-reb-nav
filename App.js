@@ -42,7 +42,7 @@ const sensorEmitter = SensorModule ? new NativeEventEmitter(SensorModule) : null
 const geoAnchor = createGeoAnchor();
 
 // Номер останнього TASK у рядку білду (видно, яка збірка встановлена на телефоні)
-const LAST_TASK = 'TASK-032';
+const LAST_TASK = 'TASK-033';
 const GNSS_SILENT_MS = 60000; // TASK-025: від GnssModule жодної події стільки часу — смуга «GNSS МОВЧИТЬ»
 const WAZE_TEST_OFFSET_M = 300; // TASK-029: зсув позиції на північ у тесті Waze
 const WAZE_TEST_DURATION_MS = 60000;
@@ -74,6 +74,10 @@ export default function App() {
   const [wazeMode, setWazeMode] = useState('fusedGps');
   const wazeModeRef = useRef('fusedGps');
   const activeModeRef = useRef(null); // режим, у якому підміна реально запущена
+  // TASK-033: точність, що подається у Waze у звичайній подачі: 'honest' (оцінка geoAnchor) або 'fixed10' (10 м)
+  const [wazeAccMode, setWazeAccMode] = useState('honest');
+  const wazeAccModeRef = useRef('honest');
+  const lastPushedAccRef = useRef(null); // фактично подана точність останнього push (для лога)
 
   const [bufferCount, setBufferCount] = useState(0);
   const [syncState, setSyncState] = useState(telemetry.getSyncState());
@@ -119,6 +123,12 @@ export default function App() {
     fusedLon: null,
     fusedAccuracy: null,
     fusedRxMs: 0,
+    nmeaLat: null, // TASK-033: NMEA-потік приймача ($GxRMC, status A); лише лог, не в geoAnchor і ядро
+    nmeaLon: null,
+    nmeaRxMs: 0,
+    nmeaQuality: null,
+    nmeaSats: null,
+    nmeaHdop: null,
     st: null, // останній gnssStatus
     stRxMs: 0,
     gnssEventMs: 0, // остання подія GnssModule (gnssGpsFix/NetFix/Status; fused не рахується — під час підміни віддає нашу позицію)
@@ -194,6 +204,10 @@ export default function App() {
           wazeModeRef.current = saved.wazeMode;
           setWazeMode(saved.wazeMode);
         }
+        if (saved && (saved.wazeAccMode === 'honest' || saved.wazeAccMode === 'fixed10')) {
+          wazeAccModeRef.current = saved.wazeAccMode;
+          setWazeAccMode(saved.wazeAccMode);
+        }
       } catch (e) {
         console.warn('Налаштування не прочитано:', e);
       }
@@ -205,7 +219,11 @@ export default function App() {
     try {
       await FileSystem.writeAsStringAsync(
         SETTINGS_FILE,
-        JSON.stringify({ rebSim: rebSimRef.current, wazeMode: wazeModeRef.current })
+        JSON.stringify({
+          rebSim: rebSimRef.current,
+          wazeMode: wazeModeRef.current,
+          wazeAccMode: wazeAccModeRef.current,
+        })
       );
     } catch (e) {
       console.warn('Налаштування не збережено:', e);
@@ -215,6 +233,14 @@ export default function App() {
   const applyRebSim = async (value) => {
     rebSimRef.current = value;
     setRebSim(value);
+    await saveSettings();
+  };
+
+  // TASK-033: перемикач «Точність для Waze»; діє з наступного push, без підтвердження (перемикають у русі)
+  const toggleWazeAcc = async (fixed10) => {
+    const mode = fixed10 ? 'fixed10' : 'honest';
+    wazeAccModeRef.current = mode;
+    setWazeAccMode(mode);
     await saveSettings();
   };
 
@@ -293,6 +319,13 @@ export default function App() {
         mockLon: staticOn && testOffsetM ? st.lon : anchorPos.lon,
         mockTestOffsetM: testOffsetM,
         mockAccuracy: anchorPos.accuracy,
+        mockPushedAccuracy: mockRunningRef.current ? lastPushedAccRef.current : null,
+        nmeaLat: d.nmeaLat,
+        nmeaLon: d.nmeaLon,
+        nmeaFixAgeMs: age(d.nmeaRxMs),
+        nmeaQuality: d.nmeaQuality,
+        nmeaSats: d.nmeaSats,
+        nmeaHdop: d.nmeaHdop,
         mockBearing: anchorPos.bearing,
         anchorAgeS: anchorPos.anchorAgeS,
         headingOffsetDeg: anchorPos.headingOffsetDeg,
@@ -569,6 +602,16 @@ export default function App() {
             d.fusedAccuracy = e.accuracy ?? null;
             d.fusedRxMs = Date.now();
           }),
+          // TASK-033: NMEA-потік приймача (лише валідні RMC); тільки в лог, geoAnchor і ядро його не бачать
+          gnssEmitter.addListener('gnssNmeaFix', (e) => {
+            const d = latestData.current;
+            d.nmeaLat = e.lat;
+            d.nmeaLon = e.lon;
+            d.nmeaQuality = e.quality ?? null;
+            d.nmeaSats = e.sats ?? null;
+            d.nmeaHdop = e.hdop ?? null;
+            d.nmeaRxMs = Date.now();
+          }),
           gnssEmitter.addListener('gnssStatus', (e) => {
             latestData.current.gnssEventMs = Date.now();
             latestData.current.st = e;
@@ -600,6 +643,12 @@ export default function App() {
       d.fusedLon = null;
       d.fusedAccuracy = null;
       d.fusedRxMs = 0;
+      d.nmeaLat = null;
+      d.nmeaLon = null;
+      d.nmeaRxMs = 0;
+      d.nmeaQuality = null;
+      d.nmeaSats = null;
+      d.nmeaHdop = null;
       d.st = null;
       d.stRxMs = 0;
     };
@@ -659,6 +708,7 @@ export default function App() {
     wazeTestEndRef.current = 0;
     staticTestRef.current = null;
     activeModeRef.current = null;
+    lastPushedAccRef.current = null;
     mockRunningRef.current = false;
     setMockRunning(false);
     if (MockLocationModule) {
@@ -712,6 +762,7 @@ export default function App() {
           activeModeRef.current = wazeModeRef.current;
           setMockRunning(true);
         }
+        lastPushedAccRef.current = 5;
         await MockLocationModule.push(stat.lat + WAZE_TEST_OFFSET_M / 111320, stat.lon, 5, 0, 0, 0, false);
         return;
       }
@@ -738,9 +789,13 @@ export default function App() {
       // altitude не подаємо: GnssModule не віддає висоту
       if (wazeTestEndRef.current > Date.now()) {
         // TASK-029: свідомий зсув на північ з високою заявленою точністю, швидкість 0
+        lastPushedAccRef.current = 5;
         await MockLocationModule.push(pos.lat + WAZE_TEST_OFFSET_M / 111320, pos.lon, 5, 0, pos.bearing, 0, false);
       } else {
-        await MockLocationModule.push(pos.lat, pos.lon, pos.accuracy, lastSpeedMpsRef.current, pos.bearing, 0, false);
+        // TASK-033: «чесна» — оцінка geoAnchor; «10 м» — фіксована точність для перевірки притягування Waze до доріг
+        const pushAcc = wazeAccModeRef.current === 'fixed10' ? 10 : pos.accuracy;
+        lastPushedAccRef.current = pushAcc;
+        await MockLocationModule.push(pos.lat, pos.lon, pushAcc, lastSpeedMpsRef.current, pos.bearing, 0, false);
       }
     } catch (e) {
       if (e && e.code === 'NOT_MOCK_APP') {
@@ -1159,6 +1214,17 @@ export default function App() {
           <Switch
             value={wazeMode === 'fusedGps'}
             onValueChange={toggleWazeMode}
+            trackColor={{ false: '#334155', true: '#0284c7' }}
+            thumbColor={'#fff'}
+          />
+        </View>
+        <View style={[styles.toggleRow, { marginTop: 8 }]}>
+          <Text style={styles.toggleLabel}>
+            Точність для Waze: {wazeAccMode === 'fixed10' ? '10 м' : 'чесна'}
+          </Text>
+          <Switch
+            value={wazeAccMode === 'fixed10'}
+            onValueChange={toggleWazeAcc}
             trackColor={{ false: '#334155', true: '#0284c7' }}
             thumbColor={'#fff'}
           />
